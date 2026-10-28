@@ -1,0 +1,14 @@
+{
+  "name": "ade",
+  "version": "0.1.0",
+  "description": "Application Delivery Engine: delivers applications with coding agents and independently verifies they work.",
+  "type": "module",
+  "private": true,
+  "main": "src/domain/index.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.js\""
+  }
+}
