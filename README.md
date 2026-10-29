@@ -13,15 +13,18 @@ ADE can now run one delivery end to end, from a plain-English request to an evid
    requirements, acceptance criteria, tasks, proposed checks and proposed acceptance
    tests, plus assumptions and open questions. The draft is validated against the
    delivery schema and saved as `draft.json` + `proposed-tests/`. It is **not approved**.
-   `ade deliver` refuses drafts.
+   `ade deliver` refuses drafts. `ade plan` prints every proposed check command and test
+   file for review. Planned checks may only be `node --test <proposed test files>`.
 1. **Approve** (`ade approve <draft.json>`): an explicit human step after reviewing the
    draft. It refuses while open questions remain. It writes `spec.json` with the SHA-256
    of each acceptance test file exactly as approved, including any edits made during review.
 2. **Execute tasks** through a coding agent: Claude Code in headless mode with
    file tools only (no Bash). The agent can write code but cannot run anything.
 3. **Verify independently.** ADE runs the approved checks itself, with controls
-   (no shell, confined working directory, minimal environment, timeout that
-   kills the process group, capped output).
+   (no shell, confined working directory, minimal environment, timeout, capped
+   output, and leftover processes in the check's process group killed when it
+   exits). Approved tests are re-checked after every check. For `node --test`
+   checks, ADE also requires evidence that real tests ran and passed.
 4. **Capture evidence.** Each check result records command, arguments, cwd,
    start/finish times, duration, exit code or signal, timeout, start errors and output.
 5. **Repair within a limit.** Real failure output goes back to the agent, then
@@ -34,7 +37,7 @@ Not yet implemented: persistence beyond the evidence files, sandboxed execution,
 ## Quick start
 
 ```sh
-npm test                                            # 209 tests, no network or live model
+npm test                                            # 299 tests, no network or live model
 
 # Full workflow (needs Claude Code logged in):
 node bin/ade.js plan "A Node.js word-count module: count words, word frequencies ignoring case and punctuation, top N words" --out ade-drafts/word-count
@@ -91,26 +94,66 @@ Code's permission settings, including the user's own, and ADE does not enforce i
 
 - Every check must name the requirements it verifies, and every `checkIds`
   entry must exist and point back. The spec is rejected before anything runs.
+- Check ids name evidence files, so they must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`
+  (no `/`, `\`, `..` or leading dot). Evidence is only ever written inside the
+  run's `results/` directory.
+- `ade approve` adds `"origin": "ade-plan"`. In such a spec every check must be
+  `node --test` followed only by approved test files, from the application
+  directory, expecting exit code 0. This is checked at approval and again at
+  delivery. A hand-written spec has no `origin` and may run any command, so
+  review its checks as you would any script you are about to run.
 - `protectedFiles` are approved acceptance tests, each with its approved `sha256`
   (required). See "Approval integrity" below.
 
 ### Approval integrity
 
-Checks only ever run against the exact acceptance tests that were approved:
+ADE compares the approved acceptance tests with their approved hashes at fixed
+points and stops the run on any difference:
 
 | When | What ADE checks | On failure |
 |---|---|---|
 | Before implementation | every `from` file matches its approved `sha256` | run fails, `APPROVED_SOURCE_CHANGED`; the agent never starts |
 | Before implementation | the copies placed in the workspace match | run fails |
-| Before every verification round | the `from` files still match | run fails, `APPROVED_SOURCE_CHANGED` |
-| Before every verification round | each directory holding approved tests (e.g. `acceptance/`) contains exactly the approved files, unchanged, as regular files | run fails, `WORKSPACE_TESTS_ALTERED`: lists each file as `changed`, `missing` or `unexpected` |
+| Before every verification round, and **after every individual check** | the `from` files still match | run fails, `APPROVED_SOURCE_CHANGED` |
+| Before every verification round, and **after every individual check** | each directory holding approved tests (e.g. `acceptance/`) contains exactly the approved files, unchanged, as regular files, and is not a symlink | run fails, `WORKSPACE_TESTS_ALTERED`: lists each file as `changed`, `missing`, `symlink`, `not a regular file`, `unexpected` or `symlinked directory` |
 
 Tests are placed once, before implementation. ADE never silently restores
-them: if the coding agent (including a repair session) changes, deletes, adds
-or symlinks a file in an acceptance directory, or the approved files change,
-no further checks run. The report's "Integrity failure" section names each
-file, with its approved and actual hashes. The workspace root is never a closed
-directory: a test placed there is hash-checked, but other root files are allowed.
+them: if the coding agent (including a repair session) or code run by a check
+changes, deletes, replaces, symlinks or adds a file there, the run stops. A
+change found after a check stops the round at once: later checks do not run,
+and the round is not evaluated. The report's "Integrity failure" section names
+each file with its approved and actual hashes, and the check that had just run.
+The workspace root is never a closed directory: a test placed there is
+hash-checked, but other root files are allowed.
+
+**What this does and does not guarantee.** Hashes *detect* that an approved
+test file differs at the moment it is checked. They do not *prevent* changes:
+check code runs as the current user and could change a file and put it back
+before the next check point. Nor do they stop application code from
+manipulating the test process it runs in (for example replacing `assert`
+functions) without touching any file. That needs isolation ADE does not have,
+such as a container or a separate user, plus human review of the tests.
+
+### What a passing `node --test` check means
+
+For a check that runs `node --test` and expects exit code 0, ADE adds its own
+test reporter to the command (visible in the recorded command) and records how
+many tests ran. The check only passes if every test file reports at least one
+test that really ran and passed (skipped and todo tests do not count), and none
+failed. This catches a wrong implementation that calls `process.exit(0)` on
+import, and test files that define no tests. Node reports such a file as one
+passing "test" named after the file, so the exit code alone would pass it.
+Output that application code prints cannot add results, because the reporter
+runs in the test runner's own process. A check that sets its own
+`--test-reporter` or `--test-isolation` is reported as `error`, because ADE then
+cannot confirm what ran.
+
+This is a safeguard against accidental or naive false passes, not proof.
+Application code that monkey-patches `node:assert` or `node:test` can still make
+a wrong implementation pass. Because it runs as the current user, it can also
+find the reporter's output file (for example from the test runner's command
+line) and write fake results to it; this was confirmed in review. Preventing
+that needs process isolation, which ADE does not have.
 
 To fix an integrity failure, restore the approved file. If the change is
 intended, review it and run `ade approve` again (it refuses to overwrite
@@ -124,7 +167,7 @@ ADE keeps four questions separate:
 | Question | Answered by | Values |
 |---|---|---|
 | Did the command execute? | `execution.status` | `completed`, `timed_out`, `could_not_start` |
-| Did the check pass? | `result.outcome` | `passed` (expected exit code), `failed` (other code or timeout), `error` (could not run) |
+| Did the check pass? | `result.outcome` | `passed` (expected exit code, plus real passing tests for `node --test`), `failed` (other code, timeout, or no test actually ran), `error` (could not run, or test results could not be confirmed) |
 | Is the requirement verified? | requirement verdict | `verified` only if every relevant check passed; any failure gives `failed`; a missing or errored result gives `unverified` |
 | Is the app deliverable? | domain `completionBlockers` | every required requirement `verified`, every task `completed` |
 
@@ -283,16 +326,30 @@ This runs `node --test "tests/**/*.test.js"` using the built-in test runner.
 ## Known limitations
 
 - **Not a sandbox.** Checks run as the current user with full filesystem and
-  network access, and they execute code the agent wrote. Use a disposable
-  machine or container for untrusted requests.
+  network access, and they execute code the agent wrote. That code can read or
+  write anything the user can. Workspace placement, process-group termination
+  and integrity checks do not change this. Use a disposable machine or container
+  for untrusted requests.
+- Approved tests are checked for changes at fixed points (see "Approval
+  integrity"); that detects changes but does not prevent them, and it does not
+  stop application code from manipulating its own test process.
+- Leftover processes are killed through the check's process group. A process
+  that moves into another session or group (`setsid`, a detached spawn) escapes
+  and keeps running.
+- With `node --test`, a check is only accepted with evidence that real tests
+  ran. Captured output is capped at 64 KB per stream; the test evidence is kept
+  separately and is not affected.
 - A passing check proves only what it tests. The quality of acceptance tests
   limits the quality of verification.
 - The agent's file access is limited by Claude Code's permission handling
   (`acceptEdits` for writes in the workspace; reads outside it were denied in a
-  probe), not by ADE. ADE does not add its own file-access controls.
+  probe), not by ADE. ADE does not add its own file-access controls. Sessions run
+  with `--setting-sources user` and `--strict-mcp-config` (no MCP servers), but
+  the user's own permission rules and hooks still apply.
 - Runs are not resumable; evidence is written once the run ends.
 - Planning quality depends on the model. Proposed tests can be wrong or weak;
   approval means a person has read them.
-- `spec.json` is the approval record. ADE detects changes to the test files, but
-  not edits to `spec.json` itself (for example a replaced hash).
+- `spec.json` is the approval record and is **not** integrity-protected. Anyone
+  (or any code running as the user) who can edit it can change its checks,
+  hashes or `origin` after approval. ADE detects changes to the test files only.
 - Planner-generated apps target Node.js, with `node --test` acceptance tests.

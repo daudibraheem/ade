@@ -16,6 +16,12 @@
  *
  * `sha256` is the approved hash of the `from` file; `ade approve` writes it.
  * Delivery refuses to verify against a file that no longer matches it.
+ *
+ * `ade approve` also writes `"origin": "ade-plan"`. Checks in such a spec came
+ * from a model, so they are restricted to `node --test <approved test files>`
+ * (see assertPlannedChecks), at approval and again at delivery. Hand-written
+ * specs have no `origin` and may use any command. `spec.json` itself is not
+ * integrity-protected: anyone who can edit it can change its checks, hashes or origin.
  */
 import { readFile } from 'node:fs/promises';
 import { dirname, isAbsolute, normalize, resolve, sep } from 'node:path';
@@ -24,7 +30,9 @@ import { createDeliveryRun } from '../domain/delivery-run.js';
 import { rejectUnknownKeys, requireNonEmptyString, requireObject } from '../domain/validation.js';
 import { createCheckSuite } from '../verification/check.js';
 
-const SPEC_FIELDS = ['request', 'workspace', 'maxRepairAttempts', 'requirements', 'tasks', 'checks', 'protectedFiles'];
+const SPEC_FIELDS = ['request', 'origin', 'workspace', 'maxRepairAttempts', 'requirements', 'tasks', 'checks', 'protectedFiles'];
+/** Marks a spec created by `ade approve` from a planner draft. */
+export const PLANNED_ORIGIN = 'ade-plan';
 /** Marks a model-generated draft (see src/planner). Drafts are never delivered. */
 export const DRAFT_KIND = 'ade-draft-spec';
 
@@ -43,6 +51,9 @@ export function prepareDelivery(spec, baseDir) {
     });
   }
   rejectUnknownKeys(spec, SPEC_FIELDS, 'Spec');
+  if (spec.origin !== undefined && spec.origin !== PLANNED_ORIGIN) {
+    throw new ValidationError(`Spec "origin" must be "${PLANNED_ORIGIN}" or absent.`, { code: 'INVALID_FIELD', details: { field: 'origin' } });
+  }
   const workspace =
     spec.workspace === undefined ? null : resolve(baseDir, requireNonEmptyString(spec.workspace, 'workspace', 'Spec'));
   const run = createDeliveryRun({
@@ -53,7 +64,34 @@ export function prepareDelivery(spec, baseDir) {
   });
   const suite = createCheckSuite(spec.checks ?? [], run.requirements);
   const protectedFiles = (spec.protectedFiles ?? []).map((entry, i) => protectedFile(entry, i, baseDir));
+  if (spec.origin === PLANNED_ORIGIN) assertPlannedChecks(suite, protectedFiles);
   return { run, suite, workspace, protectedFiles };
+}
+
+/**
+ * Planner-generated checks may only be `node --test` followed by approved test
+ * files, run from the application directory and expecting exit code 0. No
+ * other program, flag or file is accepted from model output.
+ */
+export function assertPlannedChecks(suite, protectedFiles) {
+  const approved = new Set(protectedFiles.map((f) => f.target));
+  for (const check of suite) {
+    const [flag, ...files] = check.args;
+    const supported =
+      check.command === 'node' &&
+      flag === '--test' &&
+      files.length > 0 &&
+      files.every((f) => approved.has(normalize(f))) &&
+      check.cwd === '.' &&
+      check.expectExitCode === 0;
+    if (!supported) {
+      throw new ValidationError(
+        `Check "${check.id}" (\`${[check.command, ...check.args].join(' ')}\`) is not supported in a planned spec: ` +
+          'it must be `node --test` followed only by approved acceptance test files, run from the application directory, expecting exit code 0.',
+        { code: 'UNSUPPORTED_CHECK', details: { checkId: check.id } },
+      );
+    }
+  }
 }
 
 export async function loadSpec(path) {

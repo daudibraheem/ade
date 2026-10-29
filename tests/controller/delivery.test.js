@@ -5,6 +5,7 @@ import { mkdtemp, mkdir, readFile, rm, symlink, unlink, writeFile } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deliver, orderTasks } from '../../src/controller/delivery.js';
+import { runCommand } from '../../src/verification/runner.js';
 import { prepareDelivery } from '../../src/controller/spec.js';
 import { buildReport, renderMarkdown, writeEvidence } from '../../src/report/report.js';
 import { ValidationError } from '../../src/domain/errors.js';
@@ -203,7 +204,7 @@ describe('approval integrity', () => {
     };
     const result = await deliver(prepareDelivery(spec(), dir), { agent: scriptedAgent([swap]) });
     assert.equal(result.outcome.delivered, false);
-    assert.equal(result.integrityFailure.problems[0].problem, 'missing');
+    assert.equal(result.integrityFailure.problems[0].problem, 'symlink');
   });
 
   it('rejects an unexpected file added to the closed acceptance directory', async () => {
@@ -263,6 +264,137 @@ describe('approval integrity', () => {
     assert.match(md, /## Integrity failure/);
     assert.match(md, /Before implementation \(`APPROVED_SOURCE_CHANGED`\)/);
     assert.match(md, /approved sha256 `[0-9a-f]{16}…`, found `[0-9a-f]{16}…`/);
+  });
+});
+
+describe('integrity after each check', () => {
+  // Reproduces the security audit probe: application code imported by check A rewrites the
+  // approved test of check B, which then would have passed a wrong implementation.
+  const TEST_A = `const test = require('node:test'); const assert = require('node:assert');
+test('a', () => assert.equal(require('../app.js').a(), 1));
+`;
+  const TEST_B = `const test = require('node:test'); const assert = require('node:assert');
+test('b', () => assert.equal(require('../app.js').b(), 2));
+`;
+  const sha = (text) => createHash('sha256').update(text).digest('hex');
+
+  function twoCheckSpec() {
+    return spec({
+      maxRepairAttempts: 0,
+      requirements: [
+        { id: 'FR1', description: 'a', checkIds: ['ca'] },
+        { id: 'FR2', description: 'b', checkIds: ['cb'] },
+      ],
+      tasks: [{ id: 'T1', title: 't', description: 't' }],
+      checks: [
+        { id: 'ca', command: process.execPath, args: ['--test', 'acceptance/a.test.js'], timeoutMs: 20_000, requirementIds: ['FR1'] },
+        { id: 'cb', command: process.execPath, args: ['--test', 'acceptance/b.test.js'], timeoutMs: 20_000, requirementIds: ['FR2'] },
+      ],
+      protectedFiles: [
+        { from: 'approved/a.test.js', to: 'acceptance/a.test.js', sha256: sha(TEST_A) },
+        { from: 'approved/b.test.js', to: 'acceptance/b.test.js', sha256: sha(TEST_B) },
+      ],
+    });
+  }
+
+  async function runWithApp(appCode) {
+    await writeFile(join(dir, 'approved', 'a.test.js'), TEST_A);
+    await writeFile(join(dir, 'approved', 'b.test.js'), TEST_B);
+    const executed = [];
+    const execute = (commandSpec, options) => (executed.push(commandSpec.args.at(-1)), runCommand(commandSpec, options));
+    const agent = scriptedAgent([(w) => writeFile(join(w, 'app.js'), appCode)]);
+    const result = await deliver(prepareDelivery(twoCheckSpec(), dir), { agent, execute });
+    return { result, executed };
+  }
+
+  it('stops before check B runs when check A rewrote B\'s approved test', async () => {
+    const tamper = `const fs = require('node:fs'), path = require('node:path');
+fs.writeFileSync(path.join(__dirname, 'acceptance', 'b.test.js'), "require('node:test')('b', () => {});\\n");
+exports.a = () => 1; exports.b = () => 99;`;
+    const { result, executed } = await runWithApp(tamper);
+    assert.equal(result.outcome.delivered, false);
+    assert.deepEqual(executed, ['acceptance/a.test.js'], 'check B was never executed');
+    const failure = result.integrityFailure;
+    assert.equal(failure.code, 'WORKSPACE_TESTS_ALTERED');
+    assert.equal(failure.round, 1);
+    assert.deepEqual(failure.afterCheck, { checkId: 'ca', resultId: 'round1-ca' });
+    assert.equal(failure.problems.length, 1);
+    assert.equal(failure.problems[0].path, 'acceptance/b.test.js');
+    assert.equal(failure.problems[0].problem, 'changed');
+    assert.equal(failure.problems[0].expected, sha(TEST_B));
+    assert.match(failure.problems[0].actual, /^[0-9a-f]{64}$/);
+    assert.deepEqual(result.run.requirements.map((r) => r.status), ['pending', 'pending'], 'nothing was verified');
+    const report = buildReport(result);
+    assert.equal(report.decision, 'NOT DELIVERED');
+    assert.equal(report.rounds[0].aborted, true);
+    assert.deepEqual(report.rounds[0].checks.map((c) => c.checkId), ['ca']);
+    assert.match(renderMarkdown(report), /After check `ca` in verification round 1/);
+  });
+
+  it('stops when a check deletes a later test', async () => {
+    const { result, executed } = await runWithApp(`require('node:fs').unlinkSync(require('node:path').join(__dirname, 'acceptance', 'b.test.js'));
+exports.a = () => 1; exports.b = () => 2;`);
+    assert.deepEqual(executed, ['acceptance/a.test.js']);
+    assert.deepEqual(result.integrityFailure.problems.map((p) => `${p.path}:${p.problem}`), ['acceptance/b.test.js:missing']);
+  });
+
+  it('stops when a check adds a file to the acceptance directory', async () => {
+    const { result } = await runWithApp(`require('node:fs').writeFileSync(require('node:path').join(__dirname, 'acceptance', 'extra.test.js'), '');
+exports.a = () => 1; exports.b = () => 2;`);
+    assert.deepEqual(result.integrityFailure.problems.map((p) => `${p.path}:${p.problem}`), ['acceptance/extra.test.js:unexpected']);
+  });
+
+  it('stops when a check rewrites the approved source outside the workspace', async () => {
+    const source = join(dir, 'approved', 'b.test.js');
+    const { result, executed } = await runWithApp(`require('node:fs').writeFileSync(${JSON.stringify(source)}, 'weakened');
+exports.a = () => 1; exports.b = () => 2;`);
+    assert.deepEqual(executed, ['acceptance/a.test.js']);
+    assert.equal(result.integrityFailure.code, 'APPROVED_SOURCE_CHANGED');
+    assert.equal(result.integrityFailure.afterCheck.checkId, 'ca');
+  });
+
+  it('reports the last evaluated round when a repair round is stopped after a check', async () => {
+    await writeFile(join(dir, 'approved', 'a.test.js'), TEST_A);
+    await writeFile(join(dir, 'approved', 'b.test.js'), TEST_B);
+    const tamper = `require('node:fs').writeFileSync(require('node:path').join(__dirname, 'acceptance', 'b.test.js'), '');
+exports.a = () => 1; exports.b = () => 99;`;
+    const agent = scriptedAgent([(w) => writeFile(join(w, 'app.js'), 'exports.a = () => 0; exports.b = () => 2;'), (w) => writeFile(join(w, 'app.js'), tamper)]);
+    const result = await deliver(prepareDelivery({ ...twoCheckSpec(), maxRepairAttempts: 1 }, dir), { agent });
+    assert.equal(result.integrityFailure.round, 2);
+    assert.equal(result.integrityFailure.afterCheck.checkId, 'ca');
+    const report = buildReport(result);
+    assert.deepEqual(report.rounds.map((r) => r.aborted), [false, true]);
+    const fr1 = report.requirements.find((r) => r.id === 'FR1');
+    assert.equal(fr1.status, 'failed');
+    assert.match(fr1.reasons.join(' '), /Check "ca"/, 'reasons come from round 1, not the stopped round');
+  });
+
+  it('delivers when nothing is altered', async () => {
+    const { result, executed } = await runWithApp('exports.a = () => 1; exports.b = () => 2;');
+    assert.equal(result.outcome.delivered, true, result.outcome.reason);
+    assert.deepEqual(executed, ['acceptance/a.test.js', 'acceptance/b.test.js']);
+  });
+});
+
+describe('evidence paths', () => {
+  const delivery = (id) => ({ rounds: [{ round: 1, results: [{ id }] }] });
+
+  // `dir` is the test's own temp directory; ids are relative to <dir>/evidence/results.
+  for (const id of ['../escape', '../../escape', 'a/../../../escape', 'x/b', 'a\\..\\..\\escape', '<abs>']) {
+    it(`refuses result id ${JSON.stringify(id)} and writes nothing`, async () => {
+      const out = join(dir, 'evidence');
+      const resultId = id === '<abs>' ? join(dir, 'escape') : id;
+      await assert.rejects(writeEvidence(out, delivery(resultId)), (e) => e.code === 'UNSAFE_PATH');
+      for (const path of [join(dir, 'escape.json'), join(out, 'escape.json'), join(out, 'results', 'x', 'b.json')]) {
+        await assert.rejects(readFile(path), { code: 'ENOENT' });
+      }
+      await assert.rejects(readFile(join(out, 'results')), { code: 'ENOENT' }, 'not even the results directory was created');
+    });
+  }
+
+  it('rejects a spec whose check id would escape before anything runs', () => {
+    const bad = spec({ checks: [{ ...spec().checks[0], id: '../../x' }], requirements: [{ ...spec().requirements[0], checkIds: ['../../x'] }] });
+    assert.throws(() => prepareDelivery(bad, dir), (e) => e.code === 'INVALID_ID');
   });
 });
 

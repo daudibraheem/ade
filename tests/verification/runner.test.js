@@ -1,6 +1,6 @@
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runCommand } from '../../src/verification/runner.js';
@@ -58,6 +58,25 @@ describe('runCommand', () => {
     assert.equal(rec.status, 'timed_out'); // returning at all proves the grandchild released the pipes
   });
 
+  it('stops a background process left behind by a command that completed normally', async () => {
+    const script = `const c = require('child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });
+require('fs').writeFileSync('bg.pid', String(c.pid)); c.unref();`;
+    const rec = await run(['-e', script]);
+    assert.equal(rec.status, 'completed');
+    assert.equal(rec.exitCode, 0, 'the original result is kept');
+    assert.equal(rec.timedOut, false);
+    const pid = Number(await readFile(join(workspace, 'bg.pid'), 'utf8'));
+    try {
+      assert.equal(await stopsWithin(pid, 2_000), true, 'the background child no longer runs');
+    } finally {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        // already gone
+      }
+    }
+  });
+
   it('reports a missing program as could_not_start', async () => {
     const rec = await runCommand({ command: 'ade-no-such-program', workspace, timeoutMs: 1_000 });
     assert.equal(rec.status, 'could_not_start');
@@ -105,3 +124,17 @@ describe('runCommand', () => {
     assert.equal(rec.stderrTruncated, false);
   });
 });
+
+// A killed process may stay a zombie until its new parent reaps it; that counts as stopped.
+async function stopsWithin(pid, ms) {
+  for (const end = Date.now() + ms; Date.now() < end; await new Promise((r) => setTimeout(r, 50))) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    const stat = await readFile(`/proc/${pid}/stat`, 'utf8').catch(() => '');
+    if (stat.slice(stat.lastIndexOf(')') + 2).startsWith('Z')) return true;
+  }
+  return false;
+}

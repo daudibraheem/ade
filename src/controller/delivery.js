@@ -93,20 +93,40 @@ async function runTask(run, task, agent, workspace, prompt, record, onEvent) {
 }
 
 async function verificationRound(run, suite, workspace, protectedFiles, record, execute, onEvent) {
-  // Throws IntegrityError: checks never run against tests that differ from the approved ones.
-  await verifyApprovedSources(protectedFiles);
-  const verified = await verifyWorkspaceTests(workspace, protectedFiles);
+  // Throws IntegrityError: no check starts against tests that differ from the approved ones.
+  const verified = await verifyIntegrity(workspace, protectedFiles);
   const round = record.rounds.length + 1;
   onEvent({ type: 'verifying', round, checks: suite.length });
   const startedAt = new Date().toISOString();
-  const results = await runChecks(suite, {
-    workspace,
-    execute,
-    makeId: (() => {
-      let n = 0;
-      return () => `round${round}-${suite[n++].id}`;
-    })(),
-  });
+  const completed = [];
+  let results;
+  try {
+    results = await runChecks(suite, {
+      workspace,
+      execute,
+      makeId: (() => {
+        let n = 0;
+        return () => `round${round}-${suite[n++].id}`;
+      })(),
+      // Code run by a check can change files while it runs, so the next check only starts if nothing changed.
+      afterCheck: async (check, result) => {
+        completed.push(result);
+        try {
+          await verifyIntegrity(workspace, protectedFiles);
+        } catch (error) {
+          if (!(error instanceof IntegrityError)) throw error;
+          throw new IntegrityError(`${error.message} Detected after check "${check.id}" ran; no further checks were run.`, {
+            code: error.code,
+            details: { ...error.details, round, afterCheck: { checkId: check.id, resultId: result.id } },
+          });
+        }
+      },
+    });
+  } catch (error) {
+    // Keep the results of the checks that did run as evidence; the round is not evaluated.
+    if (error instanceof IntegrityError) record.rounds.push({ round, startedAt, results: completed, evaluations: [], aborted: true });
+    throw error;
+  }
   const applied = applyVerification(run, suite, results);
   record.protectedFiles.push({ round, files: verified });
   record.rounds.push({ round, startedAt, results, evaluations: applied.evaluations });
@@ -114,11 +134,18 @@ async function verificationRound(run, suite, workspace, protectedFiles, record, 
   return applied.run;
 }
 
+async function verifyIntegrity(workspace, protectedFiles) {
+  await verifyApprovedSources(protectedFiles);
+  return verifyWorkspaceTests(workspace, protectedFiles);
+}
+
 /** Ends the run because approved tests failed integrity; anything else is a real error and is re-thrown. */
 function integrityFailed(run, record, error, round, onEvent) {
   if (!(error instanceof IntegrityError)) throw error;
-  record.integrityFailure = { round, code: error.code, message: error.message, problems: error.details.problems };
-  onEvent({ type: 'integrity-failed', round, code: error.code });
+  const { afterCheck = null, problems } = error.details;
+  round = error.details.round ?? round;
+  record.integrityFailure = { round, afterCheck, code: error.code, message: error.message, problems };
+  onEvent({ type: 'integrity-failed', round, afterCheck, code: error.code });
   return finish(run, record, `Integrity check failed: ${error.message}`, onEvent);
 }
 

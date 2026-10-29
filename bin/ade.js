@@ -62,6 +62,10 @@ async function plan(request, values) {
   console.log(`Summary: ${draft.summary}`);
   console.log(`${draft.requirements.length} requirement(s), ${draft.tasks.length} task(s), ` +
     `${draft.proposedChecks.length} proposed check(s), ${draft.proposedTestFiles.length} proposed test file(s).`);
+  console.log('Proposed checks (these commands will run during delivery once approved):');
+  for (const c of draft.proposedChecks) console.log(`  ${c.id}: ${[c.command, ...(c.args ?? [])].join(' ')}`);
+  console.log('Proposed acceptance tests:');
+  for (const f of draft.proposedTestFiles) console.log(`  ${join(outDir, f.file)}`);
   for (const a of draft.assumptions) console.log(`  assumption: ${a}`);
   for (const q of draft.openQuestions) console.log(`  OPEN QUESTION: ${q}`);
   console.log('\nThis draft is NOT approved. Review the requirements, every proposed check command and every file');

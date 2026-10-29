@@ -52,6 +52,24 @@ describe('createCheck', () => {
   }
 });
 
+describe('check ids', () => {
+  for (const id of ['../x', '../../../tmp/pwned', 'a/b', 'a\\b', '/etc/passwd', 'C:\\x', '..', '.hidden', '-flag', 'a b', 'x'.repeat(65)]) {
+    it(`rejects ${JSON.stringify(id)}, which could name a file outside the evidence directory`, () => {
+      assert.throws(() => createCheck(spec({ id })), (e) => e instanceof ValidationError && e.code === 'INVALID_ID');
+    });
+  }
+
+  it('rejects an empty id', () => {
+    assert.throws(() => createCheck(spec({ id: '' })), ValidationError);
+  });
+
+  for (const id of ['acceptance', 'acceptance-fr1', 'unit.add_2', 'A', 'x'.repeat(64)]) {
+    it(`accepts ${JSON.stringify(id)}`, () => {
+      assert.equal(createCheck(spec({ id })).id, id);
+    });
+  }
+});
+
 describe('createCheckSuite', () => {
   const reqs = () => [
     createRequirement({ id: 'req-add', description: 'Add', checkIds: ['unit'] }),

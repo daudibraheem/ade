@@ -1,7 +1,10 @@
-import { describe, it } from 'node:test';
+import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createCheckSuite } from '../../src/verification/check.js';
-import { applyVerification, evaluateRequirement, runChecks, toCheckResult } from '../../src/verification/verify.js';
+import { applyVerification, evaluateRequirement, runChecks, summarizeTestEvents, toCheckResult } from '../../src/verification/verify.js';
 import { completionBlockers, createDeliveryRun, transitionRun, transitionRunTask } from '../../src/domain/delivery-run.js';
 import { InvariantViolationError } from '../../src/domain/errors.js';
 
@@ -118,6 +121,100 @@ describe('runChecks', () => {
     assert.equal(out.length, 3);
     assert.deepEqual(calls[2], { command: 'node', args: ['smoke.js'], workspace: '/ws', cwd: '.', timeoutMs: 60_000 });
     assert.deepEqual(out.map((r) => r.id), ['id-1', 'id-2', 'id-3']);
+  });
+});
+
+describe('runChecks afterCheck', () => {
+  it('runs the hook after each check and stops when it throws', async () => {
+    const { suite } = fixture();
+    const ran = [];
+    const execute = async (spec) => (ran.push(spec.args.join(' ')), completed(0));
+    const afterCheck = async (check) => {
+      if (check.id === 'unit-add') throw new Error('stop');
+    };
+    await assert.rejects(runChecks(suite, { workspace: '/ws', execute, afterCheck }), /stop/);
+    assert.equal(ran.length, 1, 'no further check started');
+  });
+});
+
+describe('node --test evidence', () => {
+  let ws;
+  before(async () => {
+    ws = await mkdtemp(join(tmpdir(), 'ade-node-test-'));
+  });
+  after(() => rm(ws, { recursive: true, force: true }));
+
+  const TEST = "const test = require('node:test'); const assert = require('node:assert');\n";
+  async function check(files, { args } = {}) {
+    for (const [name, content] of Object.entries(files)) await writeFile(join(ws, name), content);
+    const testFiles = Object.keys(files).filter((f) => f.endsWith('.test.js'));
+    const suite = createCheckSuite(
+      [{ id: 'acc', command: process.execPath, args: args ?? ['--test', ...testFiles], timeoutMs: 20_000, requirementIds: ['FR1'] }],
+      [{ id: 'FR1', checkIds: ['acc'] }],
+    );
+    const [result] = await runChecks(suite, { workspace: ws });
+    return result;
+  }
+
+  it('passes when a real test ran and passed', async () => {
+    const result = await check({ 'a.cjs': 'exports.add = (a, b) => a + b;', 'ok.test.js': `${TEST}test('adds', () => assert.equal(require('./a.cjs').add(2, 2), 4));` });
+    assert.equal(result.outcome, 'passed', result.reason);
+    assert.equal(result.tests.passed, 1);
+    assert.match(result.reason, /1 test\(s\) ran and passed/);
+  });
+
+  it('fails a wrong implementation that forces exit code 0 on import', async () => {
+    const result = await check({ 'b.cjs': 'exports.add = () => 5; process.exit(0);', 'exit.test.js': `${TEST}test('adds', () => assert.equal(require('./b.cjs').add(2, 2), 4));` });
+    assert.equal(result.execution.exitCode, 0, 'the process really exited 0');
+    assert.equal(result.outcome, 'failed');
+    assert.match(result.reason, /no test actually ran and passed/);
+  });
+
+  it('fails a test file that defines no tests', async () => {
+    const result = await check({ 'zero.test.js': '// no tests\n' });
+    assert.equal(result.execution.exitCode, 0);
+    assert.equal(result.outcome, 'failed');
+  });
+
+  it('fails when every test was skipped', async () => {
+    const result = await check({ 'skip.test.js': `${TEST}test.skip('adds', () => assert.fail());` });
+    assert.equal(result.outcome, 'failed');
+    assert.equal(result.tests.skipped, 1);
+  });
+
+  it('fails when one of several test files ran no test', async () => {
+    const result = await check({
+      'c.cjs': 'exports.ok = true;',
+      'good.test.js': `${TEST}test('ok', () => assert.ok(require('./c.cjs').ok));`,
+      'early.test.js': `${TEST}process.exit(0); test('never', () => {});`,
+    });
+    assert.equal(result.outcome, 'failed');
+    assert.equal(result.tests.filesWithoutPassingTests.length, 1);
+    assert.match(result.tests.filesWithoutPassingTests[0], /early\.test\.js$/);
+  });
+
+  it('ignores fake test results printed by application code', async () => {
+    const fake = JSON.stringify({ event: 'test:pass', name: 'adds', nesting: 0, type: 'test' });
+    const result = await check({
+      'd.cjs': `console.log(${JSON.stringify(fake)}); console.log('# pass 5'); process.exit(0);`,
+      'spoof.test.js': `${TEST}require('./d.cjs'); test('adds', () => {});`,
+    });
+    assert.equal(result.outcome, 'failed');
+  });
+
+  it('reports an error when the check replaces the test reporter', async () => {
+    const result = await check({ 'own.test.js': `${TEST}test('ok', () => {});` }, { args: ['--test', '--test-reporter=tap', 'own.test.js'] });
+    assert.equal(result.outcome, 'error');
+    assert.match(result.reason, /cannot confirm which tests ran/);
+  });
+
+  it('does not count todo tests or the file itself', () => {
+    const lines = [
+      { event: 'test:pass', name: 'x.test.js', nesting: 0, file: '/w/x.test.js', type: 'test' },
+      { event: 'test:fail', name: 'later', nesting: 0, file: '/w/x.test.js', type: 'test', todo: true },
+    ].map((e) => JSON.stringify(e)).join('\n');
+    assert.deepEqual(summarizeTestEvents(lines), { passed: 0, failed: 0, skipped: 1, filesWithoutPassingTests: ['/w/x.test.js'] });
+    assert.ok(summarizeTestEvents(null).error);
   });
 });
 

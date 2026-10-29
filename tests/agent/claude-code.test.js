@@ -75,4 +75,15 @@ describe('createClaudeCodeAgent settings', () => {
     await agent.plan({ workspace: '/ws', prompt: 'p' });
     for (const args of calls) assert.equal(args[args.indexOf('--setting-sources') + 1], 'user');
   });
+
+  it('loads no MCP servers, so only the listed built-in tools are available', async () => {
+    const calls = [];
+    const agent = createClaudeCodeAgent({ execute: async (spec) => (calls.push(spec.args), execution({})) });
+    await agent.implement({ workspace: '/ws', prompt: 'p' });
+    await agent.plan({ workspace: '/ws', prompt: 'p' });
+    for (const args of calls) {
+      assert.ok(args.includes('--strict-mcp-config'));
+      assert.ok(!args.includes('--mcp-config'));
+    }
+  });
 });

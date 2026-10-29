@@ -9,7 +9,13 @@
  * - A minimal environment: only the variables in ENV_ALLOWLIST plus any
  *   explicitly supplied ones. Secrets in ADE's own environment are not passed on.
  * - A hard timeout that kills the whole process group.
+ * - When the program exits, anything it left running in its process group
+ *   (e.g. a background child) is killed too.
  * - Captured output is capped per stream.
+ *
+ * Process-group termination only reaches processes that stay in the group. A
+ * process that moves itself into another session or group (setsid, a detached
+ * spawn) escapes it and keeps running.
  *
  * This is NOT a sandbox. The program runs as the current user with full
  * filesystem and network access. Isolation needs a container or separate user.
@@ -97,6 +103,7 @@ export async function runCommand(spec, { env = {}, maxOutputBytes = DEFAULT_MAX_
     });
     child.on('close', () => {
       if (child.pid === undefined) return; // handled by 'error'
+      stopRemainingGroup(child.pid);
       const finishedAt = new Date();
       finish(
         Object.freeze({
@@ -146,6 +153,16 @@ function killGroup(child) {
     process.kill(-child.pid, 'SIGKILL');
   } catch {
     child.kill('SIGKILL'); // group already gone or not supported; kill the direct child
+  }
+}
+
+// The direct child has exited; kill whatever it left behind in its process group.
+// ESRCH (nothing left) is the normal case and does not affect the recorded result.
+function stopRemainingGroup(pid) {
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    // Group already gone, or process groups are not supported on this platform.
   }
 }
 

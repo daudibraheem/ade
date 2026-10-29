@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, normalize, resolve, sep } from 'node:path';
 import { DomainError } from '../domain/errors.js';
 import { rejectUnknownKeys, requireNonEmptyString, requireObject, stringList } from '../domain/validation.js';
-import { DRAFT_KIND, prepareDelivery } from '../controller/spec.js';
+import { DRAFT_KIND, PLANNED_ORIGIN, prepareDelivery } from '../controller/spec.js';
 import { sha256File } from '../controller/integrity.js';
 
 export const MAX_REQUEST_LENGTH = 10_000;
@@ -55,8 +55,9 @@ Rules:
   and lists the ids of the checks that verify it in "checkIds".
 - Tasks have ids T1, T2, ...; use "dependsOn" only where one task genuinely needs another first.
 - The application is built with Node.js and no third-party dependencies unless the request requires them.
-- Each check runs one program with arguments (no shell), from the application directory, e.g.
-  { "command": "node", "args": ["--test", "acceptance/fr1.test.mjs"] }. Prefer one check per requirement.
+- Each check must be exactly { "command": "node", "args": ["--test", <one or more paths from "testFiles">] }:
+  no other program, flags, "cwd" or "expectExitCode". Anything else is rejected. Check ids use only letters,
+  digits, ".", "_" and "-". Prefer one check per requirement.
 - Provide the acceptance test file for every check in "testFiles". Tests are ES modules named
   acceptance/<name>.test.mjs using node:test and node:assert/strict, importing the application by
   relative path. Name in the task descriptions the exact files and exports the tests import.
@@ -141,6 +142,7 @@ export function createDraft(plan, { request, generator, now = new Date() }) {
 export function specFromDraft(draft, hashes = {}) {
   return {
     request: draft.request,
+    origin: PLANNED_ORIGIN,
     maxRepairAttempts: 2,
     requirements: draft.requirements,
     tasks: draft.tasks,

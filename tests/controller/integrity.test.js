@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -70,6 +70,31 @@ describe('integrity checks', () => {
         'acceptance/unit/z.test.js:unexpected',
         'root.test.js:changed',
       ]);
+      return true;
+    });
+  });
+
+  it('names the kind of replacement: symlink or not a regular file', async () => {
+    await placeProtectedFiles(join(dir, 'ws'), files());
+    await unlink(join(dir, 'ws', 'acceptance', 'unit', 'a.test.js'));
+    await symlink(join(dir, 'src', 'a.test.js'), join(dir, 'ws', 'acceptance', 'unit', 'a.test.js'));
+    await unlink(join(dir, 'ws', 'root.test.js'));
+    await mkdir(join(dir, 'ws', 'root.test.js'));
+    await assert.rejects(verifyWorkspaceTests(join(dir, 'ws'), files()), (e) => {
+      assert.deepEqual(e.details.problems.map((p) => `${p.path}:${p.problem}`).sort(), [
+        'acceptance/unit/a.test.js:symlink',
+        'root.test.js:not a regular file',
+      ]);
+      return true;
+    });
+  });
+
+  it('rejects an acceptance directory replaced by a symlink to identical copies', async () => {
+    await placeProtectedFiles(join(dir, 'ws'), files());
+    await rename(join(dir, 'ws', 'acceptance'), join(dir, 'elsewhere'));
+    await symlink(join(dir, 'elsewhere'), join(dir, 'ws', 'acceptance'));
+    await assert.rejects(verifyWorkspaceTests(join(dir, 'ws'), files()), (e) => {
+      assert.deepEqual(e.details.problems.map((p) => `${p.path}:${p.problem}`), ['acceptance:symlinked directory']);
       return true;
     });
   });

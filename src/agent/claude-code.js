@@ -24,7 +24,8 @@ const AGENT_ENV_PREFIXES = ['ANTHROPIC_', 'CLAUDE_CODE_'];
 export function createClaudeCodeAgent({ command = 'claude', timeoutMs = DEFAULT_AGENT_TIMEOUT_MS, execute = runCommand } = {}) {
   async function invoke(prompt, workspace, toolArgs) {
     // Only the user's own settings: project settings or hooks written into the workspace by an earlier session are ignored.
-    const args = ['-p', prompt, '--output-format', 'json', '--setting-sources', 'user', ...toolArgs];
+    // No MCP servers: --strict-mcp-config with no --mcp-config loads none, so only the listed built-in tools exist.
+    const args = ['-p', prompt, '--output-format', 'json', '--setting-sources', 'user', '--strict-mcp-config', ...toolArgs];
     const execution = await execute(
       { command, args, workspace, cwd: '.', timeoutMs },
       { env: agentEnv(), maxOutputBytes: 256 * 1024 },

@@ -17,6 +17,8 @@ import {
 } from '../domain/validation.js';
 
 const CHECK_FIELDS = ['id', 'description', 'command', 'args', 'cwd', 'timeoutMs', 'expectExitCode', 'requirementIds'];
+// Check ids name evidence files, so they may not contain path separators or start with a dot.
+export const CHECK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const DEFAULT_TIMEOUT_MS = 60_000;
 export const MAX_TIMEOUT_MS = 30 * 60_000;
 
@@ -24,6 +26,12 @@ export function createCheck(input) {
   requireObject(input, 'Check');
   rejectUnknownKeys(input, CHECK_FIELDS, 'Check');
   const id = requireNonEmptyString(input.id, 'id', 'Check');
+  if (!CHECK_ID_PATTERN.test(id)) {
+    throw new ValidationError(
+      `Check id ${JSON.stringify(id)} is invalid: use 1-64 letters, digits, ".", "_" or "-", starting with a letter or digit.`,
+      { code: 'INVALID_ID', details: { entity: 'Check', field: 'id', id } },
+    );
+  }
   const requirementIds = stringList(input.requirementIds, 'requirementIds', 'Check');
   if (requirementIds.length === 0) {
     throw new ValidationError(`Check "${id}" must name at least one requirement it verifies.`, {
