@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdtemp, mkdir, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deliver, orderTasks } from '../../src/controller/delivery.js';
@@ -15,6 +16,8 @@ const assert = require('node:assert');
 const { add } = require('../math.js');
 test('adds', () => assert.equal(add(2, 3), 5));
 `;
+const WEAK = "require('node:test')('ok', () => {});\n";
+const APPROVED_SHA = createHash('sha256').update(ACCEPTANCE).digest('hex');
 
 let dir;
 
@@ -33,7 +36,7 @@ function spec(overrides = {}) {
     requirements: [{ id: 'FR1', description: 'add returns the sum', acceptanceCriteria: ['add(2,3) is 5'], checkIds: ['acceptance'] }],
     tasks: [{ id: 'T1', title: 'Implement add', description: 'Create math.js', requirementIds: ['FR1'] }],
     checks: [{ id: 'acceptance', command: process.execPath, args: ['--test', 'acceptance/**/*.test.js'], timeoutMs: 20_000, requirementIds: ['FR1'] }],
-    protectedFiles: [{ from: 'approved/math.test.js', to: 'acceptance/math.test.js' }],
+    protectedFiles: [{ from: 'approved/math.test.js', to: 'acceptance/math.test.js', sha256: APPROVED_SHA }],
     ...overrides,
   };
 }
@@ -87,18 +90,6 @@ describe('deliver', () => {
     assert.match(result.outcome.reason, /after 2 repair attempt/);
   });
 
-  it('restores protected acceptance tests that the agent weakened', async () => {
-    const tamper = async (ws) => {
-      await writeMath(BAD)(ws);
-      await mkdir(join(ws, 'acceptance'), { recursive: true });
-      await writeFile(join(ws, 'acceptance', 'math.test.js'), "require('node:test')('ok', () => {});\n");
-    };
-    const result = await deliver(prepareDelivery(spec({ maxRepairAttempts: 0 }), dir), { agent: scriptedAgent([tamper]) });
-    assert.equal(result.outcome.delivered, false);
-    assert.equal(await readFile(join(dir, 'workspace', 'acceptance', 'math.test.js'), 'utf8'), ACCEPTANCE);
-    assert.equal(result.protectedFiles[0].files[0].path, 'acceptance/math.test.js');
-  });
-
   it('gives the agent the acceptance tests to read before it starts', async () => {
     let seen;
     const peek = async (ws) => {
@@ -132,12 +123,146 @@ describe('prepareDelivery', () => {
   });
 
   it('rejects protected files that target outside the workspace', () => {
-    const protectedFiles = [{ from: 'approved/math.test.js', to: '../escape.js' }];
+    const protectedFiles = [{ from: 'approved/math.test.js', to: '../escape.js', sha256: APPROVED_SHA }];
     assert.throws(() => prepareDelivery(spec({ protectedFiles }), dir), (e) => e.code === 'UNSAFE_PATH');
+  });
+
+  it('rejects protected files without an approved hash', () => {
+    const protectedFiles = [{ from: 'approved/math.test.js', to: 'acceptance/math.test.js' }];
+    assert.throws(() => prepareDelivery(spec({ protectedFiles }), dir), (e) => e.code === 'MISSING_HASH' && /sha256sum/.test(e.message));
+  });
+
+  it('rejects a malformed approved hash', () => {
+    const protectedFiles = [{ from: 'approved/math.test.js', to: 'acceptance/math.test.js', sha256: APPROVED_SHA.toUpperCase() }];
+    assert.throws(() => prepareDelivery(spec({ protectedFiles }), dir), (e) => e.code === 'MISSING_HASH');
   });
 
   it('rejects unknown spec fields', () => {
     assert.throws(() => prepareDelivery(spec({ shell: true }), dir), (e) => e.code === 'UNKNOWN_FIELD');
+  });
+});
+
+describe('approval integrity', () => {
+  const ws = (...parts) => join(dir, 'workspace', ...parts);
+  const approved = () => join(dir, 'approved', 'math.test.js');
+
+  it('accepts unmodified approved tests and records their approved hashes per round', async () => {
+    const result = await deliver(prepareDelivery(spec(), dir), { agent: scriptedAgent([writeMath(GOOD)]) });
+    assert.equal(result.outcome.delivered, true);
+    assert.equal(result.integrityFailure, null);
+    assert.deepEqual(result.protectedFiles[0].files, [{ path: 'acceptance/math.test.js', sha256: APPROVED_SHA }]);
+  });
+
+  it('rejects an approved test changed after approval, before any agent runs', async () => {
+    await writeFile(approved(), WEAK);
+    const agent = scriptedAgent([writeMath(GOOD)]);
+    const result = await deliver(prepareDelivery(spec(), dir), { agent });
+    assert.equal(result.outcome.delivered, false);
+    assert.equal(result.run.status, 'failed');
+    assert.equal(agent.prompts.length, 0);
+    assert.equal(result.rounds.length, 0);
+    assert.equal(result.integrityFailure.code, 'APPROVED_SOURCE_CHANGED');
+    assert.equal(result.integrityFailure.problems[0].problem, 'changed');
+    assert.match(result.outcome.reason, /approve again/);
+  });
+
+  it('rejects an approved test deleted after approval', async () => {
+    await unlink(approved());
+    const result = await deliver(prepareDelivery(spec(), dir), { agent: scriptedAgent([writeMath(GOOD)]) });
+    assert.equal(result.integrityFailure.problems[0].problem, 'missing');
+    assert.equal(result.outcome.delivered, false);
+  });
+
+  it('rejects a workspace test the agent modified, without running checks', async () => {
+    const tamper = async (w) => {
+      await writeMath(BAD)(w);
+      await writeFile(join(w, 'acceptance', 'math.test.js'), WEAK);
+    };
+    const result = await deliver(prepareDelivery(spec(), dir), { agent: scriptedAgent([tamper]) });
+    assert.equal(result.outcome.delivered, false);
+    assert.equal(result.rounds.length, 0, 'no checks ran against the altered test');
+    assert.equal(result.integrityFailure.code, 'WORKSPACE_TESTS_ALTERED');
+    assert.equal(result.integrityFailure.round, 1);
+    assert.deepEqual(result.integrityFailure.problems.map((p) => [p.path, p.problem]), [['acceptance/math.test.js', 'changed']]);
+  });
+
+  it('rejects a workspace test the agent deleted', async () => {
+    const remove = async (w) => {
+      await writeMath(GOOD)(w);
+      await unlink(join(w, 'acceptance', 'math.test.js'));
+    };
+    const result = await deliver(prepareDelivery(spec(), dir), { agent: scriptedAgent([remove]) });
+    assert.deepEqual(result.integrityFailure.problems.map((p) => p.problem), ['missing']);
+  });
+
+  it('rejects a workspace test replaced by a symlink', async () => {
+    const swap = async (w) => {
+      await writeMath(GOOD)(w);
+      await unlink(join(w, 'acceptance', 'math.test.js'));
+      await symlink(approved(), join(w, 'acceptance', 'math.test.js'));
+    };
+    const result = await deliver(prepareDelivery(spec(), dir), { agent: scriptedAgent([swap]) });
+    assert.equal(result.outcome.delivered, false);
+    assert.equal(result.integrityFailure.problems[0].problem, 'missing');
+  });
+
+  it('rejects an unexpected file added to the closed acceptance directory', async () => {
+    const add = async (w) => {
+      await writeMath(GOOD)(w);
+      await mkdir(join(w, 'acceptance', 'nested'), { recursive: true });
+      await writeFile(join(w, 'acceptance', 'nested', 'extra.test.js'), WEAK);
+    };
+    const result = await deliver(prepareDelivery(spec(), dir), { agent: scriptedAgent([add]) });
+    assert.equal(result.outcome.delivered, false);
+    assert.deepEqual(result.integrityFailure.problems, [{ path: 'acceptance/nested/extra.test.js', problem: 'unexpected' }]);
+  });
+
+  it('allows files outside the acceptance directory', async () => {
+    const add = async (w) => {
+      await writeMath(GOOD)(w);
+      await writeFile(join(w, 'helper.js'), '// fine\n');
+    };
+    const result = await deliver(prepareDelivery(spec(), dir), { agent: scriptedAgent([add]) });
+    assert.equal(result.outcome.delivered, true);
+  });
+
+  it('a repair attempt cannot weaken the tests, even by rewriting the approved source', async () => {
+    const cheat = async (w) => {
+      await writeFile(approved(), WEAK);
+      await writeFile(join(w, 'acceptance', 'math.test.js'), WEAK);
+    };
+    const agent = scriptedAgent([writeMath(BAD), cheat]);
+    const result = await deliver(prepareDelivery(spec(), dir), { agent });
+    assert.equal(agent.prompts.length, 2, 'the repair session ran');
+    assert.equal(result.outcome.delivered, false);
+    assert.equal(result.rounds.length, 1, 'no verification round ran after the cheating repair');
+    assert.equal(result.integrityFailure.round, 2);
+    assert.equal(result.integrityFailure.code, 'APPROVED_SOURCE_CHANGED');
+    assert.equal(result.run.requirements[0].status, 'failed', 'the requirement keeps its last real verdict');
+  });
+
+  it('a repair attempt cannot replace the workspace test alone', async () => {
+    const cheat = (w) => writeFile(join(w, 'acceptance', 'math.test.js'), WEAK);
+    const result = await deliver(prepareDelivery(spec(), dir), { agent: scriptedAgent([writeMath(BAD), cheat]) });
+    assert.equal(result.outcome.delivered, false);
+    assert.equal(result.integrityFailure.code, 'WORKSPACE_TESTS_ALTERED');
+  });
+
+  it('tells the agent which tests and directories are read-only', async () => {
+    const agent = scriptedAgent([writeMath(BAD), writeMath(GOOD)]);
+    await deliver(prepareDelivery(spec(), dir), { agent });
+    for (const prompt of agent.prompts) {
+      assert.match(prompt, /acceptance\/math\.test\.js\) are read-only/);
+      assert.match(prompt, /Do not add, change or delete any file in acceptance\//);
+    }
+  });
+
+  it('reports the integrity failure', async () => {
+    await writeFile(approved(), WEAK);
+    const md = renderMarkdown(buildReport(await deliver(prepareDelivery(spec(), dir), { agent: scriptedAgent([]) })));
+    assert.match(md, /## Integrity failure/);
+    assert.match(md, /Before implementation \(`APPROVED_SOURCE_CHANGED`\)/);
+    assert.match(md, /approved sha256 `[0-9a-f]{16}…`, found `[0-9a-f]{16}…`/);
   });
 });
 

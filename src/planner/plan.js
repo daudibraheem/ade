@@ -16,6 +16,7 @@ import { dirname, isAbsolute, join, normalize, resolve, sep } from 'node:path';
 import { DomainError } from '../domain/errors.js';
 import { rejectUnknownKeys, requireNonEmptyString, requireObject, stringList } from '../domain/validation.js';
 import { DRAFT_KIND, prepareDelivery } from '../controller/spec.js';
+import { sha256File } from '../controller/integrity.js';
 
 export const MAX_REQUEST_LENGTH = 10_000;
 const PROPOSED_TESTS_DIR = 'proposed-tests';
@@ -132,8 +133,12 @@ export function createDraft(plan, { request, generator, now = new Date() }) {
   }
 }
 
-/** The delivery spec a draft would become once approved. */
-export function specFromDraft(draft) {
+/**
+ * The delivery spec a draft would become once approved. `hashes` maps each
+ * proposed test path to the hash being approved; by default the hash of the
+ * generated content is used (only for validating the draft's shape).
+ */
+export function specFromDraft(draft, hashes = {}) {
   return {
     request: draft.request,
     workspace: './workspace',
@@ -141,7 +146,7 @@ export function specFromDraft(draft) {
     requirements: draft.requirements,
     tasks: draft.tasks,
     checks: draft.proposedChecks,
-    protectedFiles: draft.proposedTestFiles.map((f) => ({ from: f.file, to: f.path })),
+    protectedFiles: draft.proposedTestFiles.map((f) => ({ from: f.file, to: f.path, sha256: hashes[f.path] ?? f.sha256 })),
   };
 }
 
@@ -188,8 +193,10 @@ export async function planApplication(request, { agent, outDir, now }) {
 
 /**
  * The explicit human approval step. Re-validates the (possibly hand-edited)
- * draft, checks the proposed test files exist, and writes spec.json next to
- * it. Refuses while open questions remain unless `allowOpenQuestions` is set.
+ * draft, hashes the exact test files on disk being approved (edits made during
+ * review included) and writes spec.json with those hashes. Delivery refuses to
+ * verify against any file that no longer matches. Refuses while open questions
+ * remain unless `allowOpenQuestions` is set.
  */
 export async function approveDraft(draftPath, { allowOpenQuestions = false, now = new Date() } = {}) {
   let draft;
@@ -209,12 +216,15 @@ export async function approveDraft(draftPath, { allowOpenQuestions = false, now 
     );
   }
   const dir = dirname(resolve(draftPath));
+  const hashes = {};
+  const edited = [];
   for (const file of draft.proposedTestFiles ?? []) {
-    await readFile(join(dir, file.file)).catch(() => {
+    hashes[file.path] = await sha256File(join(dir, file.file)).catch(() => {
       throw new PlanningError(`Proposed test file ${file.file} is missing.`, { code: 'INVALID_DRAFT' });
     });
+    if (hashes[file.path] !== file.sha256) edited.push(file.path);
   }
-  const spec = specFromDraft(draft);
+  const spec = specFromDraft(draft, hashes);
   try {
     prepareDelivery(spec, dir);
   } catch (error) {
@@ -222,7 +232,7 @@ export async function approveDraft(draftPath, { allowOpenQuestions = false, now 
   }
   const specPath = join(dir, 'spec.json');
   await writeNew(specPath, `${JSON.stringify(spec, null, 2)}\n`);
-  return { specPath, spec, approvedAt: new Date(now).toISOString() };
+  return { specPath, spec, editedTests: edited, approvedAt: new Date(now).toISOString() };
 }
 
 function assertTestable(draft) {

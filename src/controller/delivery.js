@@ -7,9 +7,7 @@
  * decided solely by the verification engine's results, and the run can only
  * be completed when the domain model's delivery rules are satisfied.
  */
-import { createHash } from 'node:crypto';
-import { copyFile, lstat, mkdir, readFile, realpath, unlink } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { mkdir } from 'node:fs/promises';
 import {
   addTask,
   completionBlockers,
@@ -18,6 +16,7 @@ import {
 } from '../domain/delivery-run.js';
 import { REQUIREMENT_STATUS, RUN_STATUS, TASK_STATUS } from '../domain/state-transitions.js';
 import { applyVerification, runChecks } from '../verification/verify.js';
+import { IntegrityError, closedDirectories, placeProtectedFiles, verifyApprovedSources, verifyWorkspaceTests } from './integrity.js';
 
 const OUTPUT_TAIL = 3000;
 
@@ -29,23 +28,32 @@ const OUTPUT_TAIL = 3000;
  * @param {Function} [deps.onEvent] progress callback: ({ type, ... }) => void
  */
 export async function deliver({ run, suite, workspace, protectedFiles = [] }, { agent, execute, onEvent = () => {} }) {
-  const record = { rounds: [], agentSessions: [], protectedFiles: [], outcome: null };
+  const record = { rounds: [], agentSessions: [], protectedFiles: [], integrityFailure: null, outcome: null };
   await mkdir(workspace, { recursive: true });
-  // Let the agent read the acceptance tests it will be judged by; they are restored again before each round.
-  await restoreProtectedFiles(workspace, protectedFiles);
+  // Place the approved tests once, so the agent can read what it will be judged by.
+  try {
+    await placeProtectedFiles(workspace, protectedFiles);
+  } catch (error) {
+    return integrityFailed(run, record, error, 0, onEvent);
+  }
 
   run = transitionRun(transitionRun(run, RUN_STATUS.PLANNING), RUN_STATUS.EXECUTING);
   onEvent({ type: 'executing', tasks: run.tasks.length });
 
   for (const task of orderTasks(run.tasks)) {
-    const outcome = await runTask(run, task, agent, workspace, implementationPrompt(run, task, suite), record, onEvent);
+    const prompt = implementationPrompt(run, task, suite, protectedFiles);
+    const outcome = await runTask(run, task, agent, workspace, prompt, record, onEvent);
     run = outcome.run;
     if (!outcome.ok) return finish(run, record, `Coding agent did not complete task "${task.id}".`, onEvent);
   }
 
   run = transitionRun(run, RUN_STATUS.VERIFYING);
   for (;;) {
-    run = await verificationRound(run, suite, workspace, protectedFiles, record, execute, onEvent);
+    try {
+      run = await verificationRound(run, suite, workspace, protectedFiles, record, execute, onEvent);
+    } catch (error) {
+      return integrityFailed(run, record, error, record.rounds.length + 1, onEvent);
+    }
     if (completionBlockers(run).length === 0) {
       return finish(transitionRun(run, RUN_STATUS.COMPLETED), record, 'All required requirements verified.', onEvent);
     }
@@ -63,7 +71,7 @@ export async function deliver({ run, suite, workspace, protectedFiles = [] }, { 
       requirementIds: failing.map((r) => r.id),
     });
     const task = run.tasks.at(-1);
-    const prompt = repairPrompt(run, failing, suite, record.rounds.at(-1));
+    const prompt = repairPrompt(run, failing, suite, record.rounds.at(-1), protectedFiles);
     const outcome = await runTask(run, task, agent, workspace, prompt, record, onEvent);
     run = outcome.run;
     if (!outcome.ok) return finish(run, record, `Coding agent did not complete repair task "${repairId}".`, onEvent);
@@ -82,7 +90,9 @@ async function runTask(run, task, agent, workspace, prompt, record, onEvent) {
 }
 
 async function verificationRound(run, suite, workspace, protectedFiles, record, execute, onEvent) {
-  const restored = await restoreProtectedFiles(workspace, protectedFiles);
+  // Throws IntegrityError: checks never run against tests that differ from the approved ones.
+  await verifyApprovedSources(protectedFiles);
+  const verified = await verifyWorkspaceTests(workspace, protectedFiles);
   const round = record.rounds.length + 1;
   onEvent({ type: 'verifying', round, checks: suite.length });
   const startedAt = new Date().toISOString();
@@ -95,35 +105,18 @@ async function verificationRound(run, suite, workspace, protectedFiles, record, 
     })(),
   });
   const applied = applyVerification(run, suite, results);
-  record.protectedFiles.push({ round, files: restored });
+  record.protectedFiles.push({ round, files: verified });
   record.rounds.push({ round, startedAt, results, evaluations: applied.evaluations });
   onEvent({ type: 'verified', round, verdicts: applied.evaluations.map((e) => [e.requirementId, e.verdict]) });
   return applied.run;
 }
 
-/**
- * Copies approved acceptance files into the workspace before each round, so
- * an agent cannot weaken the tests it is judged by. A symlink placed at or
- * above the target is not followed out of the workspace.
- */
-async function restoreProtectedFiles(workspace, files) {
-  const restored = [];
-  const root = await realpath(workspace);
-  for (const { source, target } of files) {
-    const destination = join(root, target);
-    await mkdir(dirname(destination), { recursive: true });
-    const parent = await realpath(dirname(destination));
-    const rel = relative(root, parent);
-    if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-      throw new Error(`Protected file "${target}" resolves outside the workspace.`);
-    }
-    const existing = await lstat(destination).catch(() => null);
-    if (existing) await unlink(destination); // replaces a modified file or a planted symlink
-    await copyFile(source, destination);
-    const sha256 = createHash('sha256').update(await readFile(destination)).digest('hex');
-    restored.push({ path: target, sha256 });
-  }
-  return restored;
+/** Ends the run because approved tests failed integrity; anything else is a real error and is re-thrown. */
+function integrityFailed(run, record, error, round, onEvent) {
+  if (!(error instanceof IntegrityError)) throw error;
+  record.integrityFailure = { round, code: error.code, message: error.message, problems: error.details.problems };
+  onEvent({ type: 'integrity-failed', round, code: error.code });
+  return finish(run, record, `Integrity check failed: ${error.message}`, onEvent);
 }
 
 function finish(run, record, reason, onEvent) {
@@ -160,18 +153,28 @@ function describeChecks(suite) {
   return suite.map((c) => `- ${c.id}: \`${[c.command, ...c.args].join(' ')}\` (in ${c.cwd})`).join('\n');
 }
 
-function implementationPrompt(run, task, suite) {
+function protectedNote(protectedFiles) {
+  if (protectedFiles.length === 0) return 'You cannot run commands.';
+  const dirs = closedDirectories(protectedFiles);
+  const where = dirs.length ? ` Do not add, change or delete any file in ${dirs.map((d) => `${d}/`).join(', ')}.` : '';
+  return (
+    `The approved acceptance tests (${protectedFiles.map((f) => f.target).join(', ')}) are read-only: read them, ` +
+    `but do not modify or delete them.${where} Any such change fails the delivery. You cannot run commands.`
+  );
+}
+
+function implementationPrompt(run, task, suite, protectedFiles) {
   const related = run.requirements.filter((r) => task.requirementIds.includes(r.id));
   return [
     `You are implementing part of this application request:\n${run.request}`,
     `Your task (${task.id}): ${task.title}\n${task.description}`,
     `Requirements this task contributes to:\n${describeRequirements(related.length ? related : run.requirements)}`,
     `After you finish, these checks will be run independently in this directory:\n${describeChecks(suite)}`,
-    'Write the code in the current directory. You may read the acceptance tests but do not modify them; they are restored before verification. You cannot run commands.',
+    `Write the code in the current directory. ${protectedNote(protectedFiles)}`,
   ].join('\n\n');
 }
 
-function repairPrompt(run, failing, suite, lastRound) {
+function repairPrompt(run, failing, suite, lastRound, protectedFiles) {
   const failures = lastRound.results
     .filter((r) => r.outcome !== 'passed')
     .map((r) => {
@@ -185,6 +188,6 @@ function repairPrompt(run, failing, suite, lastRound) {
     `Requirements not yet verified:\n${describeRequirements(failing)}`,
     `Failing checks and their actual output:\n${failures}`,
     `All checks that will be re-run:\n${describeChecks(suite)}`,
-    'Fix the application code so these checks pass. Do not modify the acceptance tests; they are restored before verification. You cannot run commands.',
+    `Fix the application code so these checks pass. ${protectedNote(protectedFiles)}`,
   ].join('\n\n');
 }

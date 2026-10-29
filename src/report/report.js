@@ -35,7 +35,7 @@ export async function writeEvidence(outDir, delivery) {
   return paths;
 }
 
-export function buildReport({ run, rounds, agentSessions, protectedFiles, outcome }) {
+export function buildReport({ run, rounds, agentSessions, protectedFiles, integrityFailure = null, outcome }) {
   const finalRound = rounds.at(-1);
   const evaluationFor = (id) => finalRound?.evaluations.find((e) => e.requirementId === id);
   return {
@@ -44,6 +44,7 @@ export function buildReport({ run, rounds, agentSessions, protectedFiles, outcom
     decision: outcome.delivered ? 'DELIVERED' : 'NOT DELIVERED',
     reason: outcome.reason,
     blockers: outcome.blockers,
+    integrityFailure,
     status: run.status,
     repairAttempts: run.repairAttempts,
     maxRepairAttempts: run.maxRepairAttempts,
@@ -97,6 +98,11 @@ export function renderMarkdown(report) {
     `- Decision: **${report.decision}**: ${report.reason}`,
     `- Repair attempts: ${report.repairAttempts} of ${report.maxRepairAttempts}`,
   ];
+  if (report.integrityFailure) {
+    const f = report.integrityFailure;
+    lines.push('', '## Integrity failure', '', `Before ${f.round === 0 ? 'implementation' : `verification round ${f.round}`} (\`${f.code}\`):`, '');
+    lines.push(...f.problems.map((p) => `- \`${p.path}\`: ${p.problem}${p.expected ? ` (approved sha256 \`${p.expected.slice(0, 16)}…\`${p.actual ? `, found \`${p.actual.slice(0, 16)}…\`` : ''})` : ''}`));
+  }
   if (report.blockers.length) {
     lines.push('', '## Blockers', '', ...report.blockers.map((b) => `- ${b}`));
   }
@@ -118,7 +124,7 @@ export function renderMarkdown(report) {
       );
     }
     if (round.protectedFiles.length) {
-      lines.push('', 'Protected acceptance files restored before this round:');
+      lines.push('', 'Approved acceptance tests verified unchanged before this round (sha256):');
       lines.push(...round.protectedFiles.map((f) => `- \`${f.path}\` sha256 \`${f.sha256.slice(0, 16)}…\``));
     }
   }

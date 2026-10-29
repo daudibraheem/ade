@@ -15,7 +15,8 @@ ADE can now run one delivery end to end, from a plain-English request to an evid
    delivery schema and saved as `draft.json` + `proposed-tests/`. It is **not approved**.
    `ade deliver` refuses drafts.
 1. **Approve** (`ade approve <draft.json>`): an explicit human step after reviewing the
-   draft. It refuses while open questions remain and writes `spec.json`.
+   draft. It refuses while open questions remain. It writes `spec.json` with the SHA-256
+   of each acceptance test file exactly as approved, including any edits made during review.
 2. **Execute tasks** through a coding agent: Claude Code in headless mode with
    file tools only (no Bash). The agent can write code but cannot run anything.
 3. **Verify independently.** ADE runs the approved checks itself, with controls
@@ -61,15 +62,38 @@ written to `examples/todo-lib/.ade-runs/<run-id>/` (`report.md`, `report.json`,
   "tasks": [{ "id": "T1", "title": "...", "description": "...", "requirementIds": ["FR1"] }],
   "checks": [{ "id": "acceptance-add", "command": "node", "args": ["--test", "acceptance/add.test.js"],
                "timeoutMs": 30000, "requirementIds": ["FR1"] }],
-  "protectedFiles": [{ "from": "approved/add.test.js", "to": "acceptance/add.test.js" }]
+  "protectedFiles": [{ "from": "approved/add.test.js", "to": "acceptance/add.test.js",
+                      "sha256": "<sha256 of approved/add.test.js>" }]
 }
 ```
 
 - Every check must name the requirements it verifies, and every `checkIds`
   entry must exist and point back. The spec is rejected before anything runs.
-- `protectedFiles` are approved acceptance tests. They are copied into the
-  workspace before implementation and again before every verification round,
-  so the agent can read them but cannot weaken them.
+- `protectedFiles` are approved acceptance tests, each with its approved `sha256`
+  (required). See "Approval integrity" below.
+
+### Approval integrity
+
+Checks only ever run against the exact acceptance tests that were approved:
+
+| When | What ADE checks | On failure |
+|---|---|---|
+| Before implementation | every `from` file matches its approved `sha256` | run fails, `APPROVED_SOURCE_CHANGED`; the agent never starts |
+| Before implementation | the copies placed in the workspace match | run fails |
+| Before every verification round | the `from` files still match | run fails, `APPROVED_SOURCE_CHANGED` |
+| Before every verification round | each directory holding approved tests (e.g. `acceptance/`) contains exactly the approved files, unchanged, as regular files | run fails, `WORKSPACE_TESTS_ALTERED`: lists each file as `changed`, `missing` or `unexpected` |
+
+Tests are placed once, before implementation. ADE never silently restores
+them: if the coding agent (including a repair session) changes, deletes, adds
+or symlinks a file in an acceptance directory, or the approved files change,
+no further checks run. The report's "Integrity failure" section names each
+file, with its approved and actual hashes. The workspace root is never a closed
+directory: a test placed there is hash-checked, but other root files are allowed.
+
+To fix an integrity failure, restore the approved file. If the change is
+intended, review it and run `ade approve` again (it refuses to overwrite
+`spec.json`, so move the old one aside first). For a hand-written spec, add each
+file's `sha256sum` output after reviewing it.
 
 ### Verification levels
 
@@ -245,6 +269,7 @@ This runs `node --test "tests/**/*.test.js"` using the built-in test runner.
   `acceptEdits` permission scope. ADE does not add its own file-access controls.
 - Runs are not resumable; evidence is written once the run ends.
 - Planning quality depends on the model. Proposed tests can be wrong or weak;
-  approval means a person has read them. `approve` does not re-check that the test
-  files are unchanged since the draft was written; the draft records their sha256.
+  approval means a person has read them.
+- `spec.json` is the approval record. ADE detects changes to the test files, but
+  not edits to `spec.json` itself (for example a replaced hash).
 - Planner-generated apps target Node.js, with `node --test` acceptance tests.

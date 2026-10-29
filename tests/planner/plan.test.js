@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { access, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,6 +16,7 @@ import {
 import { loadSpec, prepareDelivery } from '../../src/controller/spec.js';
 import { deliver } from '../../src/controller/delivery.js';
 
+const sha256 = (text) => createHash('sha256').update(text).digest('hex');
 const hasCode = (code) => (err) => err instanceof PlanningError && err.code === code;
 const exists = (path) => access(path).then(() => true, () => false);
 
@@ -194,10 +196,22 @@ describe('approveDraft', () => {
 
   it('turns a reviewed draft into a deliverable spec with the tests protected', async () => {
     const { draftPath } = await plan();
-    const { specPath, spec } = await approveDraft(draftPath);
-    assert.deepEqual(spec.protectedFiles, [{ from: 'proposed-tests/acceptance/fr1.test.mjs', to: 'acceptance/fr1.test.mjs' }]);
+    const { specPath, spec, editedTests } = await approveDraft(draftPath);
+    assert.deepEqual(spec.protectedFiles, [
+      { from: 'proposed-tests/acceptance/fr1.test.mjs', to: 'acceptance/fr1.test.mjs', sha256: sha256(TEST_FILE) },
+    ]);
+    assert.deepEqual(editedTests, []);
     const prepared = await loadSpec(specPath);
     assert.equal(prepared.suite[0].id, 'acceptance-fr1');
+  });
+
+  it('approves the exact bytes on disk, including edits made during review', async () => {
+    const { draftPath } = await plan();
+    const reviewed = `${TEST_FILE}test('reviewer addition', () => assert.equal(greet('Bo'), 'Hello, Bo!'));\n`;
+    await writeFile(join(dir, 'draft', 'proposed-tests', 'acceptance', 'fr1.test.mjs'), reviewed);
+    const { spec, editedTests } = await approveDraft(draftPath);
+    assert.equal(spec.protectedFiles[0].sha256, sha256(reviewed));
+    assert.deepEqual(editedTests, ['acceptance/fr1.test.mjs']);
   });
 
   it('refuses while open questions remain, unless explicitly allowed', async () => {
@@ -241,6 +255,19 @@ describe('approveDraft', () => {
 });
 
 describe('plan -> approve -> deliver', () => {
+  it('refuses to verify when an approved test is edited after approval', async () => {
+    const outDir = join(dir, 'draft');
+    const { draftPath } = await planApplication('Build a greeter', { agent: planner(modelPlan()), outDir });
+    const { specPath } = await approveDraft(draftPath);
+    await writeFile(join(outDir, 'proposed-tests', 'acceptance', 'fr1.test.mjs'), "import test from 'node:test';\ntest('ok', () => {});\n");
+    let built = false;
+    const builder = { name: 'mock-builder', async implement() { built = true; return { ok: true, claim: '', execution: {} }; } };
+    const result = await deliver(await loadSpec(specPath), { agent: builder });
+    assert.equal(result.outcome.delivered, false);
+    assert.equal(built, false);
+    assert.equal(result.integrityFailure.code, 'APPROVED_SOURCE_CHANGED');
+  });
+
   it('delivers an approved plan when the implementation passes the approved tests', async () => {
     const outDir = join(dir, 'draft');
     const { draftPath } = await planApplication('Build a greeter', { agent: planner(modelPlan()), outDir });

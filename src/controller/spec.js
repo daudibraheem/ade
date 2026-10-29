@@ -11,8 +11,11 @@
  *   "requirements": [{ "id": "FR1", "description": "...", "acceptanceCriteria": ["..."], "checkIds": ["acceptance"] }],
  *   "tasks": [{ "id": "T1", "title": "...", "description": "...", "requirementIds": ["FR1"] }],
  *   "checks": [{ "id": "acceptance", "command": "node", "args": ["--test", "acceptance/*.test.js"], "requirementIds": ["FR1"] }],
- *   "protectedFiles": [{ "from": "acceptance/todo.test.js", "to": "acceptance/todo.test.js" }]
+ *   "protectedFiles": [{ "from": "approved/todo.test.js", "to": "acceptance/todo.test.js", "sha256": "<64 hex chars>" }]
  * }
+ *
+ * `sha256` is the approved hash of the `from` file; `ade approve` writes it.
+ * Delivery refuses to verify against a file that no longer matches it.
  */
 import { readFile } from 'node:fs/promises';
 import { dirname, isAbsolute, normalize, resolve, sep } from 'node:path';
@@ -65,8 +68,15 @@ export async function loadSpec(path) {
 
 function protectedFile(entry, index, baseDir) {
   requireObject(entry, `protectedFiles[${index}]`);
-  rejectUnknownKeys(entry, ['from', 'to'], 'Protected file');
+  rejectUnknownKeys(entry, ['from', 'to', 'sha256'], 'Protected file');
   const from = requireNonEmptyString(entry.from, 'from', 'Protected file');
+  if (typeof entry.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(entry.sha256)) {
+    throw new ValidationError(
+      `Protected file "${from}" needs its approved SHA-256 as 64 lowercase hex characters in "sha256". ` +
+        'Specs from `ade approve` include it; for a hand-written spec, review the file and add the output of `sha256sum <file>`.',
+      { code: 'MISSING_HASH', details: { from } },
+    );
+  }
   const to = requireNonEmptyString(entry.to, 'to', 'Protected file');
   const target = normalize(to);
   if (isAbsolute(to) || target === '..' || target.startsWith(`..${sep}`)) {
@@ -75,5 +85,5 @@ function protectedFile(entry, index, baseDir) {
       details: { to },
     });
   }
-  return Object.freeze({ source: resolve(baseDir, from), target });
+  return Object.freeze({ source: resolve(baseDir, from), target, sha256: entry.sha256 });
 }

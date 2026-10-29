@@ -45,8 +45,8 @@
     { "id": "acceptance-complete", "command": "node", "args": ["--test", "acceptance/complete.test.js"], "timeoutMs": 30000, "requirementIds": ["FR3"] }
   ],
   "protectedFiles": [
-    { "from": "approved/add.test.js", "to": "acceptance/add.test.js" },
-    { "from": "approved/list.test.js", "to": "acceptance/list.test.js" },
-    { "from": "approved/complete.test.js", "to": "acceptance/complete.test.js" }
+    { "from": "approved/add.test.js", "to": "acceptance/add.test.js", "sha256": "7475411db4ec10bd870ec7e12d2f0d340c1032d823f6dea9a73db0977b311429" },
+    { "from": "approved/list.test.js", "to": "acceptance/list.test.js", "sha256": "9dec924297ee8458246caaea93dc64bb367af947388fe63e511199eea777a9f6" },
+    { "from": "approved/complete.test.js", "to": "acceptance/complete.test.js", "sha256": "2f6002d16e95d9727592c14f5dbbe8b5f54e2f374f32c6217556d4418a2649eb" }
   ]
 }

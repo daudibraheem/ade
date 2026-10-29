@@ -69,9 +69,13 @@ async function plan(request, values) {
 
 async function approve(draftPath, values) {
   try {
-    const { specPath, spec } = await approveDraft(draftPath, { allowOpenQuestions: values['allow-open-questions'] });
+    const { specPath, spec, editedTests } = await approveDraft(draftPath, { allowOpenQuestions: values['allow-open-questions'] });
     console.log(`Approved. These commands will run during delivery:`);
     for (const c of spec.checks) console.log(`  ${c.id}: ${[c.command, ...(c.args ?? [])].join(' ')}`);
+    console.log('Approved acceptance tests (delivery refuses to verify if any of them changes):');
+    for (const f of spec.protectedFiles) {
+      console.log(`  ${f.from}  sha256 ${f.sha256}${editedTests.includes(f.to) ? '  (edited during review)' : ''}`);
+    }
     console.log(`Spec: ${specPath}\nNext: ade deliver ${specPath}`);
     return 0;
   } catch (error) {
@@ -113,6 +117,7 @@ function log(event) {
     case 'task-started': return console.log(`[${at}] agent working on ${event.taskId}...`);
     case 'task-finished': return console.log(`[${at}] ${event.taskId}: agent session ${event.status}`);
     case 'verifying': return console.log(`[${at}] verification round ${event.round}: ${event.checks} check(s)`);
+    case 'integrity-failed': return console.log(`[${at}] INTEGRITY CHECK FAILED (${event.code})`);
     case 'verified': return console.log(`[${at}] ${event.verdicts.map(([id, v]) => `${id}=${v}`).join(' ')}`);
     default: return undefined;
   }
