@@ -5,22 +5,106 @@ verify that the requested functionality actually works**. A coding agent saying
 a feature is done is not treated as evidence that it works: ADE separates
 implementation, verification, failure, and successful delivery.
 
-## Current status: Step 1 — domain model only
+## Current status: MVP workflow
 
-This milestone provides the core data structures and deterministic rules that
-the rest of ADE will build on. **It does not run agents, execute checks, or
-deliver applications.** Nothing here works end to end yet.
+ADE can now run one delivery end to end, from a plain-English request to an evidence-backed report:
 
-Implemented:
+0. **Plan** (`ade plan "<request>"`): Claude Code, with every tool disabled, drafts
+   requirements, acceptance criteria, tasks, proposed checks and proposed acceptance
+   tests, plus assumptions and open questions. The draft is validated against the
+   delivery schema and saved as `draft.json` + `proposed-tests/`. It is **not approved**.
+   `ade deliver` refuses drafts.
+1. **Approve** (`ade approve <draft.json>`): an explicit human step after reviewing the
+   draft. It refuses while open questions remain and writes `spec.json`.
+2. **Execute tasks** through a coding agent: Claude Code in headless mode with
+   file tools only (no Bash). The agent can write code but cannot run anything.
+3. **Verify independently.** ADE runs the approved checks itself, with controls
+   (no shell, confined working directory, minimal environment, timeout that
+   kills the process group, capped output).
+4. **Capture evidence.** Each check result records command, arguments, cwd,
+   start/finish times, duration, exit code or signal, timeout, start errors and output.
+5. **Repair within a limit.** Real failure output goes back to the agent, then
+   every check is re-run. The run fails when the limit is reached.
+6. **Report.** `report.md` / `report.json` are built only from recorded results.
+   What the agent said appears in a separate "Agent claims (not evidence)" section.
 
-- **Delivery run**: one attempt to fulfil a user request. It holds an ID, the
-  original request, a lifecycle status, requirements, tasks, and timestamps.
-- **Requirement**: a behaviour the application must exhibit. It has a
-  verification status and a record of verification evidence.
-- **Task**: a unit of implementation work, with dependencies on other tasks
-  and optional links to requirements.
-- **Lifecycle tables**: explicit allowed transitions for runs, tasks and
-  requirements, plus the guards described below.
+Not yet implemented: persistence beyond the evidence files, sandboxed execution, UI.
+
+## Quick start
+
+```sh
+npm test                                            # 209 tests, no network or live model
+
+# Full workflow (needs Claude Code logged in):
+node bin/ade.js plan "A Node.js word-count module: count words, word frequencies ignoring case and punctuation, top N words" --out ade-drafts/word-count
+#   review ade-drafts/word-count/draft.json and proposed-tests/, edit if needed
+node bin/ade.js approve ade-drafts/word-count/draft.json
+node bin/ade.js deliver ade-drafts/word-count/spec.json
+
+# Or deliver the hand-written example:
+node bin/ade.js deliver examples/todo-lib/spec.json
+```
+
+`plan` refuses to overwrite an existing draft; `approve` refuses to overwrite an existing spec.
+Exit codes: 0 success or delivered, 1 not delivered, 2 usage, spec or planning error. Evidence is
+written to `examples/todo-lib/.ade-runs/<run-id>/` (`report.md`, `report.json`,
+`run.json`, `results/<result-id>.json`).
+
+### Spec format
+
+```json
+{
+  "request": "What the user asked for",
+  "workspace": "./workspace",
+  "maxRepairAttempts": 2,
+  "requirements": [{ "id": "FR1", "description": "...", "acceptanceCriteria": ["..."], "checkIds": ["acceptance-add"] }],
+  "tasks": [{ "id": "T1", "title": "...", "description": "...", "requirementIds": ["FR1"] }],
+  "checks": [{ "id": "acceptance-add", "command": "node", "args": ["--test", "acceptance/add.test.js"],
+               "timeoutMs": 30000, "requirementIds": ["FR1"] }],
+  "protectedFiles": [{ "from": "approved/add.test.js", "to": "acceptance/add.test.js" }]
+}
+```
+
+- Every check must name the requirements it verifies, and every `checkIds`
+  entry must exist and point back. The spec is rejected before anything runs.
+- `protectedFiles` are approved acceptance tests. They are copied into the
+  workspace before implementation and again before every verification round,
+  so the agent can read them but cannot weaken them.
+
+### Verification levels
+
+ADE keeps four questions separate:
+
+| Question | Answered by | Values |
+|---|---|---|
+| Did the command execute? | `execution.status` | `completed`, `timed_out`, `could_not_start` |
+| Did the check pass? | `result.outcome` | `passed` (expected exit code), `failed` (other code or timeout), `error` (could not run) |
+| Is the requirement verified? | requirement verdict | `verified` only if every relevant check passed; any failure gives `failed`; a missing or errored result gives `unverified` |
+| Is the app deliverable? | domain `completionBlockers` | every required requirement `verified`, every task `completed` |
+
+## Development methodology: AWS AI-DLC
+
+ADE itself is developed with [AWS AI-DLC](https://github.com/awslabs/aidlc-workflows)
+(MIT-0) in Claude Code. It is a development tool only and is not part of ADE's runtime.
+The version is pinned in `.aidlc-version` (2.11.2).
+
+- **Committed:** `.aidlc-version`, and the shared workflow records under `aidlc/spaces/`
+  (memory, and later intents, state and audit).
+- **Not committed:** `.claude/`. It is AI-DLC's generated Claude Code harness (framework
+  files, hooks, agents and skills) and is rebuilt exactly from the pinned version. AI-DLC's
+  local state (`aidlc/.aidlc-sessions/`, `aidlc/active-*`, clone id) is ignored by its own
+  `.gitignore` block.
+
+Setup after cloning ([AI-DLC install guide](https://github.com/awslabs/aidlc-workflows/blob/v2.11.2/docs/guide/18-install-and-lifecycle.md)):
+
+```sh
+# install the pinned release (download and inspect install.sh from the v2.11.2 release first)
+sh install.sh --version "$(cat .aidlc-version)"
+aidlc config --harness claude    # regenerates .claude/
+aidlc doctor
+```
+
+Then start Claude Code in this folder and run `/aidlc --doctor`, then `/aidlc <work description>`.
 
 ## Lifecycle rules
 
@@ -42,6 +126,9 @@ blocked ──► (the status it was blocked from) | failed
   what is missing.
 - `planning → executing` requires at least one requirement and one task.
 - `completed` and `failed` are terminal.
+- Each move from `verifying` to `repairing` uses one repair attempt. When
+  `maxRepairAttempts` (default 2) is used up, the move is refused with
+  `REPAIR_LIMIT_REACHED`. Resuming a blocked repair does not count.
 
 ### Task
 
@@ -63,10 +150,11 @@ pending ──► verified | failed | unverified
 verified | failed | unverified ──► pending   (clears evidence)
 ```
 
-- Evidence is `{ checkId, passed, summary? }`. `checkId` must be a non-empty
+- Evidence is `{ checkId, passed, summary?, resultId? }`. `resultId` points to the full check result. `checkId` must be a non-empty
   string and `passed` must be a boolean. Unknown fields are rejected.
-- **verified** requires at least one recorded check, and the most recent
-  result of every check must have passed.
+- **verified** requires at least one recorded check, a result for every
+  check the requirement declares in `checkIds`, and the most recent result of
+  every check must have passed.
 - **failed** requires the most recent result of at least one check to have
   failed.
 - **unverified** means verification could not be carried out. It does not
@@ -107,15 +195,20 @@ decide which checks each requirement needs.
 ## Project structure
 
 ```
-src/domain/
-  errors.js             Domain error types
-  state-transitions.js  Status constants and allowed-transition tables
-  requirement.js        Requirements and verification evidence
-  task.js               Tasks, dependency-aware transitions, cycle detection
-  delivery-run.js       Delivery run aggregate and delivery rules
-  validation.js         Shared input-validation helpers
-  index.js              Public exports
-tests/domain/           node:test suites, one per module
+bin/ade.js              CLI: ade deliver <spec.json>
+src/domain/             Step 1 domain model (runs, requirements, tasks, rules)
+src/verification/
+  check.js              Check definitions and requirement/check traceability
+  runner.js             Controlled command execution
+  verify.js             Check outcomes, requirement verdicts, applying results to a run
+src/agent/claude-code.js  Claude Code adapter: implement (file tools only), plan (no tools)
+src/planner/plan.js     Draft spec generation, validation, writing and approval
+src/controller/
+  spec.js               Spec loading and validation
+  delivery.js           Delivery controller: execute, verify, repair, decide
+src/report/report.js    Evidence files and delivery report
+examples/todo-lib/      Example spec with approved acceptance tests
+tests/                  node:test suites
 ```
 
 ## Usage sketch
@@ -141,10 +234,17 @@ npm test
 
 This runs `node --test "tests/**/*.test.js"` using the built-in test runner.
 
-## Not implemented yet
+## Known limitations
 
-- Coding-agent integration and task execution
-- Task scheduling and parallel execution
-- The verification engine (deciding and running the checks each requirement needs)
-- Rich evidence (timestamps, commands, exit codes, logs, application revision)
-- Persistence, APIs, CLI or UI
+- **Not a sandbox.** Checks run as the current user with full filesystem and
+  network access, and they execute code the agent wrote. Use a disposable
+  machine or container for untrusted requests.
+- A passing check proves only what it tests. The quality of acceptance tests
+  limits the quality of verification.
+- The agent can only write inside its workspace through Claude Code's own
+  `acceptEdits` permission scope. ADE does not add its own file-access controls.
+- Runs are not resumable; evidence is written once the run ends.
+- Planning quality depends on the model. Proposed tests can be wrong or weak;
+  approval means a person has read them. `approve` does not re-check that the test
+  files are unchanged since the draft was written; the draft records their sha256.
+- Planner-generated apps target Node.js, with `node --test` acceptance tests.

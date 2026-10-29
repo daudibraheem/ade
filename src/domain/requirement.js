@@ -8,6 +8,7 @@
 import { InvariantViolationError, ValidationError } from './errors.js';
 import { REQUIREMENT_STATUS, REQUIREMENT_TRANSITIONS, assertTransition } from './state-transitions.js';
 import {
+  assertUniqueIds,
   optionalNonEmptyString,
   rejectUnknownKeys,
   requireNonEmptyString,
@@ -15,10 +16,10 @@ import {
   stringList,
 } from './validation.js';
 
-const REQUIREMENT_FIELDS = ['id', 'description', 'acceptanceCriteria', 'required'];
-// Future milestones are expected to extend this (timestamp, command, exitCode,
-// logs, revision) in one place.
-const EVIDENCE_FIELDS = ['checkId', 'passed', 'summary'];
+const REQUIREMENT_FIELDS = ['id', 'description', 'acceptanceCriteria', 'required', 'checkIds'];
+// Full execution details (command, exit code, output, timestamps) live in the
+// verification engine's check results; `resultId` points to one of them.
+const EVIDENCE_FIELDS = ['checkId', 'passed', 'summary', 'resultId'];
 
 /**
  * Builds a validated, frozen evidence record: the outcome of one check.
@@ -38,6 +39,8 @@ export function createEvidence(input) {
   const evidence = { checkId, passed: input.passed };
   const summary = optionalNonEmptyString(input.summary, 'summary', 'Evidence');
   if (summary !== undefined) evidence.summary = summary;
+  const resultId = optionalNonEmptyString(input.resultId, 'resultId', 'Evidence');
+  if (resultId !== undefined) evidence.resultId = resultId;
   return Object.freeze(evidence);
 }
 
@@ -55,6 +58,7 @@ export function createRequirement(input) {
     description: requireNonEmptyString(input.description, 'description', 'Requirement'),
     acceptanceCriteria: stringList(input.acceptanceCriteria, 'acceptanceCriteria', 'Requirement'),
     required: input.required ?? true,
+    checkIds: uniqueStringList(input.checkIds, 'checkIds'),
     status: REQUIREMENT_STATUS.PENDING,
     evidence: [],
   });
@@ -85,7 +89,8 @@ export function latestResultsByCheck(requirement) {
 
 /**
  * Changes verification status, enforcing the minimal evidence rules:
- * - `verified`: at least one check recorded, and the latest result of every check passed.
+ * - `verified`: at least one check recorded, every declared check (`checkIds`)
+ *   has a result, and the latest result of every check passed.
  * - `failed`: the latest result of at least one check failed.
  * - `unverified`: verification could not be performed; no evidence needed.
  * - `pending`: discards evidence so a new assessment starts clean.
@@ -99,6 +104,14 @@ export function transitionRequirement(requirement, nextStatus) {
       throw new InvariantViolationError(
         `Requirement "${requirement.id}" cannot be verified: no verification evidence has been recorded.`,
         { code: 'MISSING_EVIDENCE', details: { requirementId: requirement.id } },
+      );
+    }
+    const recorded = new Set(latest.map((item) => item.checkId));
+    const missing = requirement.checkIds.filter((checkId) => !recorded.has(checkId));
+    if (missing.length) {
+      throw new InvariantViolationError(
+        `Requirement "${requirement.id}" cannot be verified: declared check(s) ${missing.join(', ')} have no result.`,
+        { code: 'MISSING_EVIDENCE', details: { requirementId: requirement.id, missingChecks: missing } },
       );
     }
     const failing = latest.filter((item) => !item.passed).map((item) => item.checkId);
@@ -121,10 +134,17 @@ export function transitionRequirement(requirement, nextStatus) {
   return freezeRequirement({ ...requirement, status: nextStatus, evidence });
 }
 
+function uniqueStringList(value, field) {
+  const list = stringList(value, field, 'Requirement');
+  assertUniqueIds(list, `${field} entry of requirement`);
+  return list;
+}
+
 function freezeRequirement(requirement) {
   return Object.freeze({
     ...requirement,
     acceptanceCriteria: Object.freeze([...requirement.acceptanceCriteria]),
+    checkIds: Object.freeze([...requirement.checkIds]),
     evidence: Object.freeze([...requirement.evidence]),
   });
 }

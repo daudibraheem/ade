@@ -19,7 +19,8 @@ import {
   toTimestamp,
 } from './validation.js';
 
-const RUN_FIELDS = ['id', 'request', 'requirements', 'tasks'];
+const RUN_FIELDS = ['id', 'request', 'requirements', 'tasks', 'maxRepairAttempts'];
+const DEFAULT_MAX_REPAIR_ATTEMPTS = 2;
 
 // Which run statuses permit which kinds of change.
 const CAN_ADD_REQUIREMENTS = [RUN_STATUS.CREATED, RUN_STATUS.PLANNING];
@@ -34,6 +35,7 @@ const CAN_RESET_REQUIREMENTS = [RUN_STATUS.VERIFYING, RUN_STATUS.REPAIRING];
  * @param {string} input.request the user's original request
  * @param {object[]} [input.requirements] requirement specs (see createRequirement)
  * @param {object[]} [input.tasks] task specs (see createTask)
+ * @param {number} [input.maxRepairAttempts] how many times the run may enter `repairing`; defaults to 2
  * @param {object} [options]
  * @param {Date|string|number} [options.now] creation time; defaults to the current time
  */
@@ -44,6 +46,7 @@ export function createDeliveryRun(input, { now } = {}) {
   const request = requireNonEmptyString(input.request, 'request', 'Delivery run');
   const requirements = specList(input.requirements, 'requirements').map(createRequirement);
   const tasks = specList(input.tasks, 'tasks').map(createTask);
+  const maxRepairAttempts = repairLimit(input.maxRepairAttempts);
   const timestamp = toTimestamp(now);
 
   const run = {
@@ -51,6 +54,8 @@ export function createDeliveryRun(input, { now } = {}) {
     request,
     status: RUN_STATUS.CREATED,
     blockedFrom: null,
+    repairAttempts: 0,
+    maxRepairAttempts,
     requirements,
     tasks,
     createdAt: timestamp,
@@ -88,9 +93,18 @@ export function transitionRun(run, nextStatus, { now } = {}) {
   if (nextStatus === RUN_STATUS.COMPLETED) {
     assertDeliverable(run);
   }
+  // Only a new repair counts against the limit; resuming a blocked repair does not.
+  const startsRepair = nextStatus === RUN_STATUS.REPAIRING && run.status === RUN_STATUS.VERIFYING;
+  if (startsRepair && run.repairAttempts >= run.maxRepairAttempts) {
+    throw new InvariantViolationError(
+      `Run "${run.id}" cannot start another repair: limit of ${run.maxRepairAttempts} reached.`,
+      { code: 'REPAIR_LIMIT_REACHED', details: { runId: run.id, repairAttempts: run.repairAttempts } },
+    );
+  }
 
   const blockedFrom = nextStatus === RUN_STATUS.BLOCKED ? run.status : null;
-  return commit(run, { status: nextStatus, blockedFrom }, now);
+  const repairAttempts = run.repairAttempts + (startsRepair ? 1 : 0);
+  return commit(run, { status: nextStatus, blockedFrom, repairAttempts }, now);
 }
 
 export function transitionRunTask(run, taskId, nextStatus, { now } = {}) {
@@ -208,6 +222,17 @@ function findIndexById(items, id, entity) {
 
 function replaceAt(items, index, item) {
   return items.map((existing, i) => (i === index ? item : existing));
+}
+
+function repairLimit(value) {
+  if (value === undefined) return DEFAULT_MAX_REPAIR_ATTEMPTS;
+  if (!Number.isInteger(value) || value < 0) {
+    throw new ValidationError('Delivery run "maxRepairAttempts" must be a non-negative integer.', {
+      code: 'INVALID_FIELD',
+      details: { entity: 'Delivery run', field: 'maxRepairAttempts' },
+    });
+  }
+  return value;
 }
 
 function specList(value, field) {

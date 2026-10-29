@@ -1,0 +1,52 @@
+{
+  "request": "Build a small Node.js todo library (CommonJS, file todo.js) with an in-memory store: add todos, list them, and mark them complete.",
+  "workspace": "./workspace",
+  "maxRepairAttempts": 2,
+  "requirements": [
+    {
+      "id": "FR1",
+      "description": "Users can add a todo with a title",
+      "acceptanceCriteria": [
+        "createStore().add(title) returns a todo { id, title, done: false } with a unique numeric id",
+        "add rejects an empty or whitespace-only title by throwing an Error"
+      ],
+      "checkIds": ["acceptance-add"]
+    },
+    {
+      "id": "FR2",
+      "description": "Users can list todos in insertion order",
+      "acceptanceCriteria": [
+        "store.list() returns all todos in the order they were added",
+        "Mutating the returned array does not change the store"
+      ],
+      "checkIds": ["acceptance-list"]
+    },
+    {
+      "id": "FR3",
+      "description": "Users can mark a todo complete",
+      "acceptanceCriteria": [
+        "store.complete(id) sets done to true and returns the updated todo",
+        "complete throws an Error for an unknown id"
+      ],
+      "checkIds": ["acceptance-complete"]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T1",
+      "title": "Implement the todo store",
+      "description": "Create todo.js exporting createStore(), which returns an object with add, list and complete methods, as described by the acceptance criteria.",
+      "requirementIds": ["FR1", "FR2", "FR3"]
+    }
+  ],
+  "checks": [
+    { "id": "acceptance-add", "command": "node", "args": ["--test", "acceptance/add.test.js"], "timeoutMs": 30000, "requirementIds": ["FR1"] },
+    { "id": "acceptance-list", "command": "node", "args": ["--test", "acceptance/list.test.js"], "timeoutMs": 30000, "requirementIds": ["FR2"] },
+    { "id": "acceptance-complete", "command": "node", "args": ["--test", "acceptance/complete.test.js"], "timeoutMs": 30000, "requirementIds": ["FR3"] }
+  ],
+  "protectedFiles": [
+    { "from": "approved/add.test.js", "to": "acceptance/add.test.js" },
+    { "from": "approved/list.test.js", "to": "acceptance/list.test.js" },
+    { "from": "approved/complete.test.js", "to": "acceptance/complete.test.js" }
+  ]
+}

@@ -333,3 +333,53 @@ describe('consistency', () => {
     assert.equal(run.status, 'created');
   });
 });
+
+describe('repair limit', () => {
+  const failRequirement = (run) => {
+    run = recordRequirementEvidence(run, 'req-todo', { checkId: 'e2e', passed: false });
+    return transitionRunRequirement(run, 'req-todo', 'failed');
+  };
+  const repairAndReverify = (run) => {
+    run = transitionRun(run, 'repairing');
+    run = transitionRunRequirement(run, 'req-todo', 'pending');
+    run = transitionRun(run, 'verifying');
+    return failRequirement(run);
+  };
+
+  it('defaults to two repair attempts and counts each one', () => {
+    let run = failRequirement(runAwaitingVerification());
+    assert.equal(run.maxRepairAttempts, 2);
+    assert.equal(run.repairAttempts, 0);
+    run = repairAndReverify(run);
+    run = repairAndReverify(run);
+    assert.equal(run.repairAttempts, 2);
+    assert.throws(() => transitionRun(run, 'repairing'), hasCode(InvariantViolationError, 'REPAIR_LIMIT_REACHED'));
+    assert.equal(transitionRun(run, 'failed').status, 'failed');
+  });
+
+  it('a limit of zero forbids repairs', () => {
+    let run = createDeliveryRun({
+      request: 'x',
+      maxRepairAttempts: 0,
+      requirements: [{ id: 'r', description: 'r' }],
+      tasks: [{ id: 't', title: 't', description: 't' }],
+    });
+    run = transitionRun(runTask(moveRun(run, ['planning', 'executing']), 't'), 'verifying');
+    assert.throws(() => transitionRun(run, 'repairing'), hasCode(InvariantViolationError, 'REPAIR_LIMIT_REACHED'));
+  });
+
+  it('resuming a blocked repair does not use another attempt', () => {
+    let run = transitionRun(failRequirement(runAwaitingVerification()), 'repairing');
+    run = transitionRun(transitionRun(run, 'blocked'), 'repairing');
+    assert.equal(run.repairAttempts, 1);
+  });
+
+  for (const [label, value] of [['a negative limit', -1], ['a fractional limit', 1.5], ['a string limit', '2']]) {
+    it(`rejects ${label}`, () => {
+      assert.throws(
+        () => createDeliveryRun({ request: 'x', maxRepairAttempts: value }),
+        hasCode(ValidationError, 'INVALID_FIELD'),
+      );
+    });
+  }
+});

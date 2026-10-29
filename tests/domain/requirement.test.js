@@ -180,3 +180,35 @@ describe('requirement verification', () => {
     assert.deepEqual(req, snapshot);
   });
 });
+
+describe('declared checks', () => {
+  const declared = () => createRequirement({ ...validInput(), checkIds: ['unit', 'e2e'] });
+
+  it('stores declared check ids and defaults to none', () => {
+    assert.deepEqual(declared().checkIds, ['unit', 'e2e']);
+    assert.ok(Object.isFrozen(declared().checkIds));
+    assert.deepEqual(createRequirement(validInput()).checkIds, []);
+  });
+
+  it('rejects duplicate declared check ids', () => {
+    assert.throws(
+      () => createRequirement({ ...validInput(), checkIds: ['unit', 'unit'] }),
+      hasCode(ValidationError, 'DUPLICATE_ID'),
+    );
+  });
+
+  it('refuses to verify while a declared check has no result', () => {
+    const req = recordEvidence(declared(), { checkId: 'unit', passed: true });
+    assert.throws(
+      () => transitionRequirement(req, 'verified'),
+      (err) => hasCode(InvariantViolationError, 'MISSING_EVIDENCE')(err) && err.details.missingChecks[0] === 'e2e',
+    );
+  });
+
+  it('verifies once every declared check has passed', () => {
+    let req = recordEvidence(declared(), { checkId: 'unit', passed: true });
+    req = recordEvidence(req, { checkId: 'e2e', passed: true, resultId: 'res-1' });
+    assert.equal(transitionRequirement(req, 'verified').status, 'verified');
+    assert.equal(req.evidence[1].resultId, 'res-1');
+  });
+});

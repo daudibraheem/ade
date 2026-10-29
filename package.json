@@ -5,6 +5,9 @@
   "type": "module",
   "private": true,
   "main": "src/domain/index.js",
+  "bin": {
+    "ade": "bin/ade.js"
+  },
   "engines": {
     "node": ">=22"
   },
