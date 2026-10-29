@@ -35,12 +35,13 @@ export async function writeEvidence(outDir, delivery) {
   return paths;
 }
 
-export function buildReport({ run, rounds, agentSessions, protectedFiles, integrityFailure = null, outcome }) {
+export function buildReport({ run, workspace, rounds, agentSessions, protectedFiles, integrityFailure = null, outcome }) {
   const finalRound = rounds.at(-1);
   const evaluationFor = (id) => finalRound?.evaluations.find((e) => e.requirementId === id);
   return {
     runId: run.id,
     request: run.request,
+    workspace,
     decision: outcome.delivered ? 'DELIVERED' : 'NOT DELIVERED',
     reason: outcome.reason,
     blockers: outcome.blockers,
@@ -95,6 +96,7 @@ export function renderMarkdown(report) {
     '',
     `- Run: \`${report.runId}\``,
     `- Request: ${report.request}`,
+    `- Workspace: \`${report.workspace}\``,
     `- Decision: **${report.decision}**: ${report.reason}`,
     `- Repair attempts: ${report.repairAttempts} of ${report.maxRepairAttempts}`,
   ];

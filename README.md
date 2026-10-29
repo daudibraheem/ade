@@ -51,12 +51,34 @@ Exit codes: 0 success or delivered, 1 not delivered, 2 usage, spec or planning e
 written to `examples/todo-lib/.ade-runs/<run-id>/` (`report.md`, `report.json`,
 `run.json`, `results/<result-id>.json`).
 
+### Application workspace
+
+Each delivery builds the application in a **fresh, empty directory under the OS
+temp directory** (for example `/tmp/ade-<run>-XXXXXX`). The path is printed and
+recorded in the report. Generated application code is kept out of the ADE
+repository; only the evidence goes to `.ade-runs/`. Use `--workspace <dir>` (or
+`"workspace"` in the spec) to choose another location. ADE refuses the location
+(`WORKSPACE_NOT_EMPTY` / `WORKSPACE_NOT_ISOLATED`) if:
+
+- the directory is not empty, so earlier files cannot affect a run; or
+- a parent directory holds a `package.json` (Node would apply its settings, e.g.
+  ADE's own `"type": "module"`), a `.git`, `CLAUDE.md`, `.claude/CLAUDE.md` or
+  `.claude/settings.json`. The user's own `~/.claude` configuration is exempt.
+
+The coding agent runs with `--setting-sources user`, so a `.claude/settings.json`
+(for example hooks) written into the workspace by one session is not loaded by the next.
+
+Workspace placement is **not a sandbox**. The application and its checks still run
+as the current user with full filesystem and network access. In one probe with
+this configuration, Claude Code denied the agent's Read of a file outside its
+workspace (recorded as a permission denial). That behaviour comes from Claude
+Code's permission settings, including the user's own, and ADE does not enforce it.
+
 ### Spec format
 
 ```json
 {
   "request": "What the user asked for",
-  "workspace": "./workspace",
   "maxRepairAttempts": 2,
   "requirements": [{ "id": "FR1", "description": "...", "acceptanceCriteria": ["..."], "checkIds": ["acceptance-add"] }],
   "tasks": [{ "id": "T1", "title": "...", "description": "...", "requirementIds": ["FR1"] }],
@@ -265,8 +287,9 @@ This runs `node --test "tests/**/*.test.js"` using the built-in test runner.
   machine or container for untrusted requests.
 - A passing check proves only what it tests. The quality of acceptance tests
   limits the quality of verification.
-- The agent can only write inside its workspace through Claude Code's own
-  `acceptEdits` permission scope. ADE does not add its own file-access controls.
+- The agent's file access is limited by Claude Code's permission handling
+  (`acceptEdits` for writes in the workspace; reads outside it were denied in a
+  probe), not by ADE. ADE does not add its own file-access controls.
 - Runs are not resumable; evidence is written once the run ends.
 - Planning quality depends on the model. Proposed tests can be wrong or weak;
   approval means a person has read them.

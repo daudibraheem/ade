@@ -4,8 +4,9 @@
  *
  *   ade plan "<request>" [--out <dir>] [--agent-command <path>]   draft a spec for review
  *   ade approve <draft.json> [--allow-open-questions]             turn a reviewed draft into spec.json
- *   ade deliver <spec.json> [--out <dir>] [--agent-command <path>]
+ *   ade deliver <spec.json> [--workspace <empty dir>] [--out <dir>] [--agent-command <path>]
  *
+ * By default each delivery builds the app in a fresh directory under the OS temp directory.
  * Exit codes: 0 success / delivered, 1 not delivered, 2 usage, spec or planning error.
  */
 import { dirname, join, resolve } from 'node:path';
@@ -19,7 +20,7 @@ import { approveDraft, planApplication } from '../src/planner/plan.js';
 const USAGE = `Usage:
   ade plan "<request>" [--out <dir>] [--agent-command <path>]
   ade approve <draft.json> [--allow-open-questions]
-  ade deliver <spec.json> [--out <dir>] [--agent-command <path>]`;
+  ade deliver <spec.json> [--workspace <empty dir>] [--out <dir>] [--agent-command <path>]`;
 
 async function main(argv) {
   const { values, positionals } = parseArgs({
@@ -27,6 +28,7 @@ async function main(argv) {
     allowPositionals: true,
     options: {
       out: { type: 'string' },
+      workspace: { type: 'string' },
       'agent-command': { type: 'string' },
       'allow-open-questions': { type: 'boolean' },
       help: { type: 'boolean' },
@@ -96,8 +98,16 @@ async function deliverSpec(specPath, values) {
   const outDir = resolve(values.out ?? join(dirname(resolve(specPath)), '.ade-runs', prepared.run.id));
   const agent = createClaudeCodeAgent({ command: values['agent-command'] });
 
-  console.log(`ADE run ${prepared.run.id}\nWorkspace: ${prepared.workspace}\nEvidence:  ${outDir}`);
-  const delivery = await deliver(prepared, { agent, onEvent: log });
+  if (values.workspace) prepared.workspace = resolve(values.workspace);
+  console.log(`ADE run ${prepared.run.id}\nEvidence:  ${outDir}`);
+  let delivery;
+  try {
+    delivery = await deliver(prepared, { agent, onEvent: log });
+  } catch (error) {
+    if (!error.code?.startsWith('WORKSPACE_')) throw error;
+    console.error(`Workspace rejected [${error.code}]: ${error.message}`);
+    return 2;
+  }
   const paths = await writeEvidence(outDir, delivery);
   console.log(`\n${delivery.outcome.delivered ? 'DELIVERED' : 'NOT DELIVERED'}: ${delivery.outcome.reason}`);
   console.log(`Report: ${paths.reportMarkdown}`);
@@ -113,6 +123,7 @@ function draftName(request) {
 function log(event) {
   const at = new Date().toISOString().slice(11, 19);
   switch (event.type) {
+    case 'workspace': return console.log(`Workspace: ${event.workspace}`);
     case 'executing': return console.log(`[${at}] executing ${event.tasks} task(s)`);
     case 'task-started': return console.log(`[${at}] agent working on ${event.taskId}...`);
     case 'task-finished': return console.log(`[${at}] ${event.taskId}: agent session ${event.status}`);

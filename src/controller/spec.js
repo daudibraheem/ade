@@ -6,7 +6,7 @@
  * Example (paths are relative to the spec file):
  * {
  *   "request": "A todo library",
- *   "workspace": "./workspace",
+ *   "workspace": "./app",            (optional; default: a fresh temporary directory per run)
  *   "maxRepairAttempts": 2,
  *   "requirements": [{ "id": "FR1", "description": "...", "acceptanceCriteria": ["..."], "checkIds": ["acceptance"] }],
  *   "tasks": [{ "id": "T1", "title": "...", "description": "...", "requirementIds": ["FR1"] }],
@@ -43,7 +43,8 @@ export function prepareDelivery(spec, baseDir) {
     });
   }
   rejectUnknownKeys(spec, SPEC_FIELDS, 'Spec');
-  const workspace = resolve(baseDir, requireNonEmptyString(spec.workspace, 'workspace', 'Spec'));
+  const workspace =
+    spec.workspace === undefined ? null : resolve(baseDir, requireNonEmptyString(spec.workspace, 'workspace', 'Spec'));
   const run = createDeliveryRun({
     request: spec.request,
     requirements: spec.requirements,

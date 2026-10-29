@@ -1,6 +1,5 @@
 {
   "request": "Build a small Node.js todo library (CommonJS, file todo.js) with an in-memory store: add todos, list them, and mark them complete.",
-  "workspace": "./workspace",
   "maxRepairAttempts": 2,
   "requirements": [
     {

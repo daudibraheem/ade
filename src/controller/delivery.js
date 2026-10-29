@@ -7,7 +7,6 @@
  * decided solely by the verification engine's results, and the run can only
  * be completed when the domain model's delivery rules are satisfied.
  */
-import { mkdir } from 'node:fs/promises';
 import {
   addTask,
   completionBlockers,
@@ -16,6 +15,7 @@ import {
 } from '../domain/delivery-run.js';
 import { REQUIREMENT_STATUS, RUN_STATUS, TASK_STATUS } from '../domain/state-transitions.js';
 import { applyVerification, runChecks } from '../verification/verify.js';
+import { prepareWorkspace } from './workspace.js';
 import { IntegrityError, closedDirectories, placeProtectedFiles, verifyApprovedSources, verifyWorkspaceTests } from './integrity.js';
 
 const OUTPUT_TAIL = 3000;
@@ -26,10 +26,13 @@ const OUTPUT_TAIL = 3000;
  * @param {{ implement: Function, name: string }} deps.agent
  * @param {Function} [deps.execute] command runner for checks (injectable for tests)
  * @param {Function} [deps.onEvent] progress callback: ({ type, ... }) => void
+ * @param {string} [deps.tempRoot] where fresh workspaces are created (default: OS temp directory)
+ * @throws {WorkspaceError} before anything runs, if the workspace is not empty or not isolated
  */
-export async function deliver({ run, suite, workspace, protectedFiles = [] }, { agent, execute, onEvent = () => {} }) {
-  const record = { rounds: [], agentSessions: [], protectedFiles: [], integrityFailure: null, outcome: null };
-  await mkdir(workspace, { recursive: true });
+export async function deliver({ run, suite, workspace, protectedFiles = [] }, { agent, execute, onEvent = () => {}, tempRoot }) {
+  workspace = await prepareWorkspace(workspace, { runId: run.id, tempRoot });
+  const record = { workspace, rounds: [], agentSessions: [], protectedFiles: [], integrityFailure: null, outcome: null };
+  onEvent({ type: 'workspace', workspace });
   // Place the approved tests once, so the agent can read what it will be judged by.
   try {
     await placeProtectedFiles(workspace, protectedFiles);

@@ -66,3 +66,13 @@ describe('createClaudeCodeAgent plan', () => {
     assert.equal(session.text, '{"summary":"x"}');
   });
 });
+
+describe('createClaudeCodeAgent settings', () => {
+  it('loads only user settings, so project settings written into the workspace are ignored', async () => {
+    const calls = [];
+    const agent = createClaudeCodeAgent({ execute: async (spec) => (calls.push(spec.args), execution({})) });
+    await agent.implement({ workspace: '/ws', prompt: 'p' });
+    await agent.plan({ workspace: '/ws', prompt: 'p' });
+    for (const args of calls) assert.equal(args[args.indexOf('--setting-sources') + 1], 'user');
+  });
+});

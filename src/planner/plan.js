@@ -141,7 +141,6 @@ export function createDraft(plan, { request, generator, now = new Date() }) {
 export function specFromDraft(draft, hashes = {}) {
   return {
     request: draft.request,
-    workspace: './workspace',
     maxRepairAttempts: 2,
     requirements: draft.requirements,
     tasks: draft.tasks,

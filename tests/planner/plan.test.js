@@ -262,7 +262,7 @@ describe('plan -> approve -> deliver', () => {
     await writeFile(join(outDir, 'proposed-tests', 'acceptance', 'fr1.test.mjs'), "import test from 'node:test';\ntest('ok', () => {});\n");
     let built = false;
     const builder = { name: 'mock-builder', async implement() { built = true; return { ok: true, claim: '', execution: {} }; } };
-    const result = await deliver(await loadSpec(specPath), { agent: builder });
+    const result = await deliver(await loadSpec(specPath), { agent: builder, tempRoot: dir });
     assert.equal(result.outcome.delivered, false);
     assert.equal(built, false);
     assert.equal(result.integrityFailure.code, 'APPROVED_SOURCE_CHANGED');
@@ -279,7 +279,7 @@ describe('plan -> approve -> deliver', () => {
         return { ok: true, claim: 'Done.', execution: { status: 'completed', exitCode: 0 } };
       },
     };
-    const result = await deliver(await loadSpec(specPath), { agent: builder });
+    const result = await deliver(await loadSpec(specPath), { agent: builder, tempRoot: dir });
     assert.equal(result.outcome.delivered, true);
     assert.equal(result.rounds[0].results[0].execution.exitCode, 0);
   });
